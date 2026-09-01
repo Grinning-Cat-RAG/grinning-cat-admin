@@ -2,6 +2,10 @@
 fileWatcherType = "poll"
 enableXsrfProtection = true
 
+[browser]
+# Disable usage-stats telemetry ("Collecting usage statistics." log line)
+gatherUsageStats = false
+
 [runner]
 # Reduce memory usage if needed
 fastReruns = true

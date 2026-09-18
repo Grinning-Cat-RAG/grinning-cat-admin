@@ -29,4 +29,12 @@ def get_env(name):
 
 
 def get_env_bool(name):
-    return get_env(name) in ("1", "true")
+    """Read a supported env variable as a boolean.
+
+    The comparison is case-insensitive: a `True` written in the .env file must
+    not silently turn into False, which for
+    GRINNING_CAT_API_SECURE_CONNECTION would downgrade the connection to plain
+    HTTP and send the credentials in clear.
+    """
+    value = get_env(name)
+    return str(value).strip().lower() in ("1", "true") if value is not None else False

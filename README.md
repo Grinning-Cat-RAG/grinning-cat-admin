@@ -65,17 +65,23 @@ The admin interface will be available at `http://localhost:8501`
 The admin UI connects to your Grinning Cat Core instance via REST API. Configure the connection in your `.env` file:
 
 ```env
-GRINNING_CAT_API_URL=http://your-grinning-cat-instance:1865
-GRINNING_CAT_API_KEY=your-api-key
+GRINNING_CAT_API_HOST=your-grinning-cat-instance
+GRINNING_CAT_API_PORT=1865
+GRINNING_CAT_API_SECURE_CONNECTION=false
 ```
 
 ### Authentication
 
-The admin interface supports multiple authentication methods:
+The admin interface supports two ways of authenticating against Grinning Cat Core:
 
-- **Local authentication**: Username/password stored in the admin database
-- **JWT tokens**: Secure token-based authentication
-- **Integration with Grinning Cat Core**: Sync users from your Cat instance
+- **Credentials**: username and password are exchanged for a JWT on the Core
+  instance. The token is kept in the browser's localStorage until its `exp`
+  claim, and the permissions of the logged-in user decide which sections are
+  reachable.
+- **API key**: set `GRINNING_CAT_API_KEY` to the `CAT_API_KEY` of your Core
+  instance. The login form is skipped and every call is made with that key, so
+  the whole UI is available to anyone who can reach it. Leave it unset unless
+  the UI is only exposed to trusted users.
 
 ## Contributing
 
@@ -85,7 +91,7 @@ We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) f
 
 1. Fork the repository
 2. Create a feature branch: `git checkout -b feature/amazing-feature`
-3. Make your changes and add tests
+3. Make your changes and add tests, then run them with `make test`
 4. Commit your changes: `git commit -m 'Add amazing feature'`
 5. Push to the branch: `git push origin feature/amazing-feature`
 6. Open a Pull Request

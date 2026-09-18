@@ -30,5 +30,8 @@ dev:
 	uv pip compile -U -o requirements.txt pyproject.toml
 	docker buildx build . -f Dockerfile:dhi -t grinning-cat-admin:dev
 
+test: ## Run the test suite.
+	@$(PYTHON) -m pytest
+
 check: ## Check requirements for the local virtual environment.
 	@uv sync --check

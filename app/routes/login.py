@@ -14,6 +14,10 @@ from app.utils import (
 def login_page():
     st.header("Login Page")
 
+    auth_error = st.session_state.pop("auth_error", None)
+    if auth_error:
+        st.error(auth_error)
+
     st.sidebar.warning("Please log in to access the admin features.")
 
     # Render login form
@@ -36,12 +40,10 @@ def login_page():
 
             st.session_state["token"] = token
 
-            # Persist the token with a simulated expiry envelope. The 'me'
-            # entry is intentionally NOT written here: set_local_storage() is
-            # asynchronous (JS-based) and a st.rerun() fired in the same render
-            # cycle would race against it. We only populate session_state via
-            # _build_me_data(); the 'me' localStorage entry is written on the
-            # next page refresh by _get_cookie_me()/cache_cookie_me() in main.py.
+            # Persist the token with a simulated expiry envelope; it is the only
+            # thing that survives a page refresh. The user data goes to
+            # session_state only, and _get_cookie_me() rebuilds it from the API
+            # after a refresh.
             set_with_expiry("token", token, token)
             build_me_data()
 

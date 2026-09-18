@@ -30,3 +30,11 @@ Issues = "https://github.com/matteocacciola/grinning-cat-admin/issues"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["app*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

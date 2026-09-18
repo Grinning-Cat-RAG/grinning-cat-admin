@@ -9,7 +9,7 @@ from app.utils import (
     build_client_configuration,
     has_access,
     run_toast,
-    cache_cookie_me,
+    build_me_data,
     get_settings,
     render_json_form,
 )
@@ -166,7 +166,7 @@ def _list_agents(cookie_me: Dict | None):
                             st.toast(f"Agent {agent} cloned successfully!", icon="✅")
                             st.session_state.pop("agent_to_clone", None)
                             if cookie_me:
-                                cache_cookie_me()
+                                build_me_data()
                             time.sleep(1)  # Wait for a moment before rerunning
                             st.rerun()
                         else:
@@ -222,7 +222,7 @@ def _list_agents(cookie_me: Dict | None):
                             st.toast(f"Agent {agent} destroyed successfully!", icon="✅")
                             st.session_state.pop("agent_to_destroy", None)
                             if cookie_me:
-                                cache_cookie_me()
+                                build_me_data()
                             time.sleep(1)  # Wait for a moment before rerunning
                             st.rerun()
                         else:
@@ -275,9 +275,9 @@ def _create_agent(cookie_me: Dict | None):
             if result.created:
                 st.toast(f"Agent {agent_id} created successfully!", icon="✅")
                 if cookie_me:
-                    cache_cookie_me()
-                    time.sleep(1)  # Wait for a moment before rerunning
-                    st.rerun()
+                    build_me_data()
+                time.sleep(1)  # Wait for a moment before rerunning
+                st.rerun()
             else:
                 st.toast(f"Failed to create agent {agent_id}", icon="❌")
         except Exception as e:
@@ -344,12 +344,11 @@ def _management_mode(cookie_me: Dict | None):
         "When management mode is active, only users with SYSTEM permission can access the app."
     )
 
-    plugin_id = "mgmt_message"
     try:
-        # read through the standard SDK admin endpooint (same as the embedder
+        # read through the standard SDK admin endpoint (same as the embedder
         # read path) returning a PluginSettingsOutput object with .value/.scheme
         plugin_settings, types = get_settings(
-            client.admins.get_plugin_settings(plugin_id),
+            client.admins.get_plugin_settings("mgmt_message"),
             is_selected=True,
         )
     except Exception as e:

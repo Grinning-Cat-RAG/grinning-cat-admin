@@ -1,11 +1,10 @@
 import asyncio
-import json
 import time
 from typing import Dict
 import streamlit as st
 from dotenv import load_dotenv
 from grinning_cat_python_sdk import GrinningCatClient
-from streamlit_js_eval import remove_local_storage
+from requests.exceptions import HTTPError
 
 from app.constants import CHECK_INTERVAL, WELCOME_MESSAGE
 from app.env import get_env
@@ -13,9 +12,10 @@ from app.utils import (
     get_with_expiry,
     build_agents_options_select,
     build_client_configuration,
-    cache_cookie_me,
+    build_me_data,
     clear_auth_cookies,
     has_access,
+    is_api_key_mode,
     is_system_agent_selected,
 )
 from app.routes.agentic_workflows import agentic_workflows_management
@@ -38,53 +38,73 @@ from app.routes.vector_databases import vector_databases_management
 from app.routes.welcome import welcome
 
 
-def _rehydrate_me_from_api() -> Dict | None:
-    """Rebuild the full 'me' dict from /auth/me when localStorage cannot provide it."""
+def _logout(message: str, icon: str, keep_message: bool = False):
+    """Drop the session and the persisted token, then restart the script."""
+    rejected_token = st.session_state.get("token")
+
+    st.session_state.clear()
+    clear_auth_cookies()
+    if keep_message:
+        # Survives the clear() above; login_page() displays and pops it.
+        st.session_state["auth_error"] = message
+        # Removing the localStorage entry is asynchronous: remember the token
+        # the backend just refused so that a slow removal cannot feed it back
+        # to us and spin the login/refuse cycle forever.
+        st.session_state["rejected_token"] = rejected_token
+
+    st.toast(message, icon=icon)
+    time.sleep(1)  # let the asynchronous localStorage removal land first
+
+    st.rerun()
+
+
+def _get_cookie_me() -> Dict | None:
+    """Return the current user's 'me' dict for a credentials session.
+
+    Only the token is persisted across page refreshes, so 'me' is rebuilt from
+    /auth/me whenever session_state is empty. Returns None in API-key mode,
+    where there is no logged-in user to describe, and when the backend cannot
+    be reached, so the next rerun retries.
+    """
+    # session_state is authoritative within a Streamlit session
+    if "me" in st.session_state:
+        return st.session_state["me"]
+
     if not st.session_state.get("token"):
         return None
+
     try:
-        cache_cookie_me()
-        return st.session_state.get("me")
+        return build_me_data()
+    except HTTPError as e:
+        status = e.response.status_code if e.response is not None else None
+        if status in (401, 403):
+            # The backend rejected the token: this is an expired or revoked
+            # session, not an API-key one. Granting the API-key branch here
+            # would show the whole admin UI to a user the backend refuses.
+            _logout("Your session has expired. Please log in again.", "⏱️", keep_message=True)
+        print(f"Error rehydrating me from API: {e}")
+        return None
     except Exception as e:
         print(f"Error rehydrating me from API: {e}")
         return None
 
 
-def _get_cookie_me() -> Dict | None:
-    """Return the current user's 'me' dict from session_state or localStorage."""
-    # session_state is authoritative within a Streamlit session
-    if "me" in st.session_state:
-        return st.session_state["me"]
+# Entries that identify the browser session rather than the selected agent.
+# Wiping them logs the user out and drops the app into the API-key branch.
+_SESSION_SCOPED_KEYS = (
+    "token",
+    "me",
+    "_session_key",
+    "status_connection",
+    "initial_auth_check_done",
+)
 
-    # On a true browser page-refresh session_state is empty; try localStorage.
-    # Use a session-scoped key so Streamlit does not memoize a stale "" across
-    # different browser sessions.
-    cookie_me = get_with_expiry(
-        "me", component_key=f"getLS_me_{st.session_state['_session_key']}"
-    )
-    if not cookie_me:
-        return None
 
-    try:
-        me = json.loads(cookie_me)
-    except json.JSONDecodeError as e:
-        # Entries written before the JS-escaping fix are corrupted beyond
-        # repair: rebuild from the API like a lightweight entry.
-        print(f"Error decoding 'me' localStorage entry: {e}")
-        me = _rehydrate_me_from_api()
-        if me is None:
-            # Nothing rewrote the entry: drop it so the next refresh does not
-            # hit the same undecodable value again.
-            remove_local_storage("me")
-        return me
-
-    # Lightweight entry (only username/id/exp written after the login fix):
-    # re-fetch full data from the API.
-    if "agents" not in me:
-        return _rehydrate_me_from_api()
-
-    st.session_state["me"] = me
-    return me
+def _reset_agent_scoped_state():
+    """Drop every per-agent entry (including widget keys), keeping the session."""
+    preserved = {k: st.session_state[k] for k in _SESSION_SCOPED_KEYS if k in st.session_state}
+    st.session_state.clear()
+    st.session_state.update(preserved)
 
 
 def _build_agents_toggle_select(k: str, cookie_me: Dict | None):
@@ -103,7 +123,7 @@ def _build_agents_toggle_select(k: str, cookie_me: Dict | None):
     if menu_options[choice] is None:
         return
 
-    st.session_state.clear()
+    _reset_agent_scoped_state()
     st.session_state["agent_id"] = choice
     st.rerun()
 
@@ -193,7 +213,7 @@ def _check_status():
 def _render_sidebar_navigation(cookie_me: Dict | None):
     """Render the sidebar navigation menu"""
     st.session_state["selected_page"] = st.session_state.get("selected_page")
-    if not st.session_state.get("token"):
+    if not st.session_state.get("token") and not is_api_key_mode():
         st.session_state["selected_page"] = None
         return
 
@@ -332,13 +352,7 @@ For security reasons, please consider creating admin users and logging in by cre
         # logout button
         logout_button = st.button("Logout", type="primary", use_container_width=True)
         if logout_button:
-            st.session_state.clear()
-            clear_auth_cookies()
-
-            st.toast("Logged out successfully.", icon="🚪")
-            time.sleep(1)  # Wait for a moment before rerunning
-
-            st.rerun()
+            _logout("Logged out successfully.", "🚪")
 
 
 async def _main():
@@ -369,14 +383,13 @@ async def _main():
     # --- First render after a true browser page-refresh ---
     # session_state is empty; we need to read the token from localStorage
     # asynchronously (via the web component).
-    st.title(WELCOME_MESSAGE)
-
     if not st.session_state.get("initial_auth_check_done"):
         # First render: fire the async localStorage read and show a loading screen.
         st.session_state["initial_auth_check_done"] = True
         get_with_expiry(
             "token", component_key=f"getLS_token_{st.session_state['_session_key']}"
         )
+        st.title(WELCOME_MESSAGE)
         loading_page()
         return
 
@@ -384,13 +397,20 @@ async def _main():
     cookie_token = get_with_expiry(
         "token", component_key=f"getLS_token_{st.session_state['_session_key']}"
     )
-    if cookie_token:
+    if cookie_token and cookie_token != st.session_state.get("rejected_token"):
         st.session_state["token"] = cookie_token
         time.sleep(0.5)
         st.rerun()
         return
 
-    # No (valid) token found → show login page.
+    # No stored credentials: run against the configured API key when there is
+    # one, otherwise ask for a username and password.
+    if is_api_key_mode():
+        _render_sidebar_navigation(None)
+        await _render_page(None)
+        return
+
+    st.title(WELCOME_MESSAGE)
     login_page()
 
 

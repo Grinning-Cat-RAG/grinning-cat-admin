@@ -222,11 +222,19 @@ def show_overlay_spinner(message="Processing..."):
     return spinner_container
 
 
+def is_api_key_mode() -> bool:
+    """True when the UI is configured to talk to the backend with a static API key."""
+    return bool(get_env("GRINNING_CAT_API_KEY"))
+
+
 def build_client_configuration():
+    # The SDK sends auth_key as `Authorization: Bearer <...>` and the backend
+    # routes it by shape (JWT -> credentials auth, anything else -> API-key
+    # auth), so a credentials token always wins over the configured API key.
     return Configuration(
         host=get_env("GRINNING_CAT_API_HOST").replace("https://", "").replace("http://", ""),
         port=int(get_env("GRINNING_CAT_API_PORT")),
-        auth_key=st.session_state.get("token"),
+        auth_key=st.session_state.get("token") or get_env("GRINNING_CAT_API_KEY"),
         secure_connection=get_env_bool("GRINNING_CAT_API_SECURE_CONNECTION"),
     )
 
@@ -350,7 +358,11 @@ def has_access(resource: str, required_role: str | None, cookie_me: Dict | None,
 
 
 def clear_auth_cookies():
-    """Clear authentication-related localStorage entries."""
+    """Clear authentication-related localStorage entries.
+
+    'me' is no longer written by this app, but entries left by older versions
+    must still be dropped on logout.
+    """
     remove_local_storage("token")
     remove_local_storage("me")
 
@@ -451,10 +463,12 @@ def _decode_agents(raw_agents: list) -> list:
 
 def build_me_data() -> Dict:
     """
-    Call /auth/me and return a normalised me_data dict.
-    Stores the result in st.session_state["me"] but does NOT write any
-    localStorage entry. Use this at login time so that st.rerun() does not
-    race with set_local_storage().
+    Call /auth/me, store the result in st.session_state["me"] and return it.
+
+    Nothing is written to localStorage: only the token is persisted there, and
+    'me' is rebuilt from the API whenever session_state is empty. That keeps
+    the permissions the UI enforces in sync with the backend and avoids racing
+    the asynchronous set_local_storage() against a st.rerun().
     """
     client = GrinningCatClient(build_client_configuration())
     res = client.auth.me(st.session_state.get("token"))
@@ -470,31 +484,3 @@ def build_me_data() -> Dict:
     }
     st.session_state["me"] = me_data
     return me_data
-
-
-def write_me_data(me_data: Dict, token: str):
-    """
-    Write the minimal me envelope to localStorage.
-    Call this only when you are NOT about to call st.rerun() in the same
-    render cycle, otherwise the local-storage write will race with the rerun.
-    """
-    me_minimal = {
-        "username": me_data["username"],
-        "id": me_data["id"],
-        "exp": me_data["exp"],
-    }
-    set_with_expiry("me", json.dumps(me_minimal), token)
-
-
-def cache_cookie_me():
-    """
-    Convenience wrapper: fetch /auth/me, store in session_state AND write the
-    minimal localStorage envelope.
-    Use this only on page-refresh rehydration (where no st.rerun() follows
-    immediately). At login time, call _build_me_data() instead.
-    """
-    token = st.session_state.get("token")
-    if not token:
-        return None
-    me_data = build_me_data()
-    write_me_data(me_data, token)

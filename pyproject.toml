@@ -34,6 +34,7 @@ include = ["app*"]
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "ruff==0.15.5",
 ]
 
 [tool.pytest.ini_options]

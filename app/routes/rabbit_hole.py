@@ -5,7 +5,6 @@ from typing import Dict
 import streamlit as st
 from grinning_cat_python_sdk import GrinningCatClient
 import json
-import base64
 
 from app.utils import build_agents_select, show_overlay_spinner, build_client_configuration, has_access, run_toast
 
@@ -104,7 +103,7 @@ def _upload_files(agent_id: str, cookie_me: Dict | None):
             return
 
         try:
-            spinner_container = show_overlay_spinner(f"Loading files to RAG...")
+            spinner_container = show_overlay_spinner("Loading files to RAG...")
 
             client.rabbit_hole.post_files(
                 file_paths=file_paths,
@@ -152,7 +151,7 @@ def _upload_url(agent_id: str, cookie_me: Dict | None):
             return
 
         try:
-            spinner_container = show_overlay_spinner(f"Loading URL to RAG...")
+            spinner_container = show_overlay_spinner("Loading URL to RAG...")
 
             metadata_dict = json.loads(metadata)
             client.rabbit_hole.post_web(

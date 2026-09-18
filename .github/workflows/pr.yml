@@ -1,0 +1,38 @@
+name: Grinning-Cat Action on Pull Requests
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main, develop]
+
+jobs:
+  linter:
+    name: "Run linter"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/ruff-action@v4.1.0
+        with:
+          version-file: uv.lock
+  test:
+    name: "Run Tests"
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      # Same shape as `make install`: the project itself is not installed, the
+      # test suite reaches `app` through the repo root (see tests/conftest.py).
+      - name: Install dependencies
+        run: uv sync --frozen --no-install-project
+      - name: Run tests
+        run: uv run --no-sync python -m pytest --color=yes -W ignore --disable-warnings
+

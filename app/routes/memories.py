@@ -1,4 +1,3 @@
-import base64
 import time
 from typing import Dict
 import streamlit as st
@@ -202,7 +201,7 @@ def _view_conversation_history(agent_id: str, user_id: str, conversation_id: str
 
         # Delete confirmation
         if has_access("MEMORY", "DELETE", cookie_me) and st.session_state.get("conversation_to_delete"):
-            st.warning(f"⚠️ Are you sure you want to permanently delete this conversation history?")
+            st.warning("⚠️ Are you sure you want to permanently delete this conversation history?")
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("Yes, Delete History", type="primary"):
@@ -213,11 +212,11 @@ def _view_conversation_history(agent_id: str, user_id: str, conversation_id: str
 
                         result = client.conversation.delete_conversation(agent_id, user_id, conversation_id)
                         if result.deleted:
-                            st.toast(f"Conversation history deleted successfully!", icon="✅")
+                            st.toast("Conversation history deleted successfully!", icon="✅")
                             st.session_state.pop("conversation_to_delete", None)
                             time.sleep(1)  # Wait for a moment before rerunning
                         else:
-                            st.toast(f"Failed to delete conversation history", icon="❌")
+                            st.toast("Failed to delete conversation history", icon="❌")
                     except Exception as e:
                         st.toast(f"Error deleting conversation history: {e}", icon="❌")
                     finally:

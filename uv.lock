@@ -278,7 +278,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "grinning-cat-python-sdk", git = "https://github.com/DEH-RAG/grinning-cat-python-sdk.git?rev=v1.0.5" },
+    { name = "grinning-cat-python-sdk", git = "https://github.com/DEH-RAG/grinning-cat-python-sdk.git?rev=v1.0.8" },
     { name = "msgpack", specifier = ">=1.2.1,<=2.0.0" },
     { name = "python-dotenv", specifier = ">=1.2.0,<=2.0.0" },
     { name = "python-slugify", specifier = ">=8.0.0,<=9.0.0" },
@@ -290,8 +290,8 @@ requires-dist = [
 
 [[package]]
 name = "grinning-cat-python-sdk"
-version = "1.0.5"
-source = { git = "https://github.com/DEH-RAG/grinning-cat-python-sdk.git?rev=v1.0.5#e650505698b7c837bd8006bed8edcd75d6d7e098" }
+version = "1.0.8"
+source = { git = "https://github.com/DEH-RAG/grinning-cat-python-sdk.git?rev=v1.0.8#24e3a41a35c5796768a3ff99cef3d6ce296a9a6f" }
 dependencies = [
     { name = "pydantic" },
     { name = "pylint" },

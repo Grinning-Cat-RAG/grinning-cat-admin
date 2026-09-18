@@ -5,6 +5,7 @@ from typing import Dict
 import streamlit as st
 from dotenv import load_dotenv
 from grinning_cat_python_sdk import GrinningCatClient
+from streamlit_js_eval import remove_local_storage
 
 from app.constants import CHECK_INTERVAL, WELCOME_MESSAGE
 from app.env import get_env
@@ -37,6 +38,18 @@ from app.routes.vector_databases import vector_databases_management
 from app.routes.welcome import welcome
 
 
+def _rehydrate_me_from_api() -> Dict | None:
+    """Rebuild the full 'me' dict from /auth/me when localStorage cannot provide it."""
+    if not st.session_state.get("token"):
+        return None
+    try:
+        cache_cookie_me()
+        return st.session_state.get("me")
+    except Exception as e:
+        print(f"Error rehydrating me from API: {e}")
+        return None
+
+
 def _get_cookie_me() -> Dict | None:
     """Return the current user's 'me' dict from session_state or localStorage."""
     # session_state is authoritative within a Streamlit session
@@ -55,20 +68,20 @@ def _get_cookie_me() -> Dict | None:
     try:
         me = json.loads(cookie_me)
     except json.JSONDecodeError as e:
+        # Entries written before the JS-escaping fix are corrupted beyond
+        # repair: rebuild from the API like a lightweight entry.
         print(f"Error decoding 'me' localStorage entry: {e}")
-        return None
+        me = _rehydrate_me_from_api()
+        if me is None:
+            # Nothing rewrote the entry: drop it so the next refresh does not
+            # hit the same undecodable value again.
+            remove_local_storage("me")
+        return me
 
     # Lightweight entry (only username/id/exp written after the login fix):
     # re-fetch full data from the API.
     if "agents" not in me:
-        token = st.session_state.get("token")
-        if token:
-            try:
-                cache_cookie_me()
-                return st.session_state.get("me")
-            except Exception as e:
-                print(f"Error rehydrating me from API: {e}")
-        return None
+        return _rehydrate_me_from_api()
 
     st.session_state["me"] = me
     return me

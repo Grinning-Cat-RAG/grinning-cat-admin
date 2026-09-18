@@ -320,7 +320,7 @@ def _list_plugins_installed(
             plugins.installed, key=lambda x: (x.name or "").lower()
         )
         paginated_installed, current_page, total_pages = _paginate_items(
-            sorted_installed, "installed", ITEMS_PER_PAGE
+            sorted_installed, "installed", ITEMS_PER_PAGE,
         )
 
         # Display paginated installed plugins
@@ -444,7 +444,7 @@ You have to activate the plugin before managing its settings.""")
             # the system-level plugin settings routes moved into the
             # mgmt_message plugin; for a not-active plugin the per-agent read
             # returns the model defaults (same content shown before)
-            plugin_settings = client.plugins.get_plugin_settings(plugin_id, agent_id)
+            plugin_settings = client.admins.get_plugin_settings(plugin_id)
             with st.expander("Plugin's default configuration", icon="⚙️"):
                 st.json(get_settings(plugin_settings, is_selected=False)[0])
         except Exception as e:

@@ -381,6 +381,19 @@ def _get_exp_from_jwt(token: str) -> int:
     return int(time.time()) + int(get_env("GRINNING_CAT_JWT_EXPIRE_MINUTES")) * 60
 
 
+def _escape_for_js_string(value: str) -> str:
+    r"""
+    Escape a value for the single-quoted JS string literal that
+    streamlit_js_eval builds: localStorage.setItem('<key>', '<value>').
+
+    The value is interpolated verbatim, so the JS parser consumes its escape
+    sequences: every backslash produced by json.dumps() would be eaten (the
+    nested \" of the 'me' envelope becoming a bare ", which no longer decodes)
+    and a single quote would terminate the literal altogether.
+    """
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
 def set_with_expiry(key: str, value: str, token: str):
     """
     Write a value to localStorage wrapped in an envelope:
@@ -389,7 +402,7 @@ def set_with_expiry(key: str, value: str, token: str):
     expiry is aligned with the server-side token validity.
     """
     envelope = {"value": value, "expire": _get_exp_from_jwt(token)}
-    set_local_storage(key, json.dumps(envelope))
+    set_local_storage(key, _escape_for_js_string(json.dumps(envelope)))
 
 
 def get_with_expiry(key: str, component_key: str | None = None) -> str | None:

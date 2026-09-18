@@ -345,10 +345,11 @@ def _management_mode(cookie_me: Dict | None):
     )
 
     try:
-        # read through the standard SDK admin endpoint (same as the embedder
-        # read path) returning a PluginSettingsOutput object with .value/.scheme
+        # GET /plugins/system/settings/mgmt_message, the standard system-level
+        # plugin read: it returns a PluginSettingsOutput (.value/.scheme) built
+        # from system:plugins:mgmt_message, falling back to the model defaults
         plugin_settings, types = get_settings(
-            client.admins.get_plugin_settings("mgmt_message"),
+            client.custom.get_custom("/mgmt_message/settings", DEFAULT_SYSTEM_KEY),
             is_selected=True,
         )
     except Exception as e:
@@ -366,9 +367,11 @@ def _management_mode(cookie_me: Dict | None):
         if st.form_submit_button("Save"):
             try:
                 spinner_container = show_overlay_spinner("Saving management message settings...")
-                # plugin-owned system settings route (moved out of the core:
-                # PUT /mgmt_message/settings, SYSTEM WRITE — same pattern as
-                # the embedder PUT /embedder/settings/{name})
+                # The plugin owns its write route (PUT /mgmt_message/settings,
+                # SYSTEM WRITE) because the agent-level plugin settings routes
+                # refuse it: mgmt_message is a system plugin. It persists on
+                # the system agent's plugin key, system:plugins:mgmt_message,
+                # which is what the read above serves.
                 client.custom.put_custom(
                     "/mgmt_message/settings",
                     DEFAULT_SYSTEM_KEY,

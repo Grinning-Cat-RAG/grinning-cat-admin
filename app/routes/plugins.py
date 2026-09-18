@@ -441,9 +441,8 @@ def manage_plugin(plugin_id: str, untoggling_plugins_ids: List[str]):
 You have to activate the plugin before managing its settings.""")
 
         try:
-            # the system-level plugin settings routes moved into the
-            # mgmt_message plugin; for a not-active plugin the per-agent read
-            # returns the model defaults (same content shown before)
+            # for a plugin that is not active on this agent the per-agent read
+            # is unavailable: the system-level read serves the plugin defaults
             plugin_settings = client.admins.get_plugin_settings(plugin_id)
             with st.expander("Plugin's default configuration", icon="⚙️"):
                 st.json(get_settings(plugin_settings, is_selected=False)[0])

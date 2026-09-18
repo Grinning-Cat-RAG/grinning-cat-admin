@@ -3,6 +3,8 @@ import time
 from typing import Dict
 import streamlit as st
 from grinning_cat_python_sdk import GrinningCatClient
+from grinning_cat_python_sdk.models.api.nested.plugins import PluginSettingsOutput
+from grinning_cat_python_sdk.utils import deserialize
 
 from app.utils import (
     show_overlay_spinner,
@@ -341,15 +343,21 @@ def _management_mode(cookie_me: Dict | None):
     st.header("Management Mode")
     st.caption(
         "Configure the global management/notice message of the instance. "
-        "When management mode is active, only users with SYSTEM permission can access the app."
+        "While management mode is active every route answers 404, for every user: "
+        "this page keeps working because it reads and writes through the plugin's "
+        "own routes, which are the only ones left open."
     )
 
     try:
-        # GET /plugins/system/settings/mgmt_message, the standard system-level
-        # plugin read: it returns a PluginSettingsOutput (.value/.scheme) built
-        # from system:plugins:mgmt_message, falling back to the model defaults
+        # The plugin owns its read route too, and it is the only one the core
+        # keeps answering while management mode is on. get_custom() hands back
+        # the parsed JSON, so it has to be deserialized before get_settings(),
+        # which works on a PluginSettingsOutput (.value / .scheme).
         plugin_settings, types = get_settings(
-            client.custom.get_custom("/mgmt_message/settings", DEFAULT_SYSTEM_KEY),
+            deserialize(
+                client.custom.get_custom("/mgmt_message/settings", DEFAULT_SYSTEM_KEY),
+                PluginSettingsOutput,
+            ),
             is_selected=True,
         )
     except Exception as e:

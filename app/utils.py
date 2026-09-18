@@ -222,6 +222,35 @@ def show_overlay_spinner(message="Processing..."):
     return spinner_container
 
 
+def get_management_state() -> Dict[str, Any]:
+    """Read the instance's management banner from the mgmt_message plugin.
+
+    GET /mgmt_message/global_message is public by design and is one of the few
+    routes the core keeps answering while management mode is on, so it is the
+    only reliable way for the UI to know. A failed read returns {}: the admin
+    must not lock itself out of its own System page over an unreachable banner.
+    """
+    try:
+        return GrinningCatClient(build_client_configuration()).custom.get_global_message() or {}
+    except Exception as e:
+        print(f"Error reading the management banner: {e}")
+        return {}
+
+
+def is_management_active(management: Dict[str, Any] | None = None) -> bool:
+    return bool((management or {}).get("management_active"))
+
+
+def management_banner_message(management: Dict[str, Any] | None = None) -> str:
+    """The text to show while management mode is on.
+
+    The management message is the one describing the maintenance; the global
+    notice is used as a fallback when the former was left empty.
+    """
+    management = management or {}
+    return management.get("management_message") or management.get("global_message") or ""
+
+
 def is_api_key_mode() -> bool:
     """True when the UI is configured to talk to the backend with a static API key."""
     return bool(get_env("GRINNING_CAT_API_KEY"))

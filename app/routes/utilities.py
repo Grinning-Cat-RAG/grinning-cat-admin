@@ -10,6 +10,7 @@ from app.utils import (
     show_overlay_spinner,
     build_client_configuration,
     has_access,
+    is_management_active,
     run_toast,
     build_me_data,
     get_settings,
@@ -423,6 +424,12 @@ def utilities_management(cookie_me: Dict | None):
             "permission": has_access("SYSTEM", "DELETE", cookie_me, only_admin=True),
         },
     }
+    if is_management_active(st.session_state.get("management")):
+        # Everything else in here talks to routes the core is answering 404 on:
+        # leave only the entry that can switch management mode back off, and
+        # drop the placeholder so the form shows straight away.
+        menu_options = {"Management mode": menu_options["Management mode"]}
+
     if not any(option["permission"] for option in menu_options.values() if option["page"]):
         st.error("You do not have access to any utilities.")
         return

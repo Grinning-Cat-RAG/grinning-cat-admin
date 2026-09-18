@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from grinning_cat_python_sdk import GrinningCatClient
 from requests.exceptions import HTTPError
 
-from app.constants import CHECK_INTERVAL, WELCOME_MESSAGE
+from app.constants import CHECK_INTERVAL, DEFAULT_SYSTEM_KEY, WELCOME_MESSAGE
 from app.env import get_env
 from app.utils import (
     get_with_expiry,
@@ -14,9 +14,12 @@ from app.utils import (
     build_client_configuration,
     build_me_data,
     clear_auth_cookies,
+    get_management_state,
     has_access,
     is_api_key_mode,
+    is_management_active,
     is_system_agent_selected,
+    management_banner_message,
 )
 from app.routes.agentic_workflows import agentic_workflows_management
 from app.routes.auth_handlers import auth_handlers_management
@@ -210,12 +213,32 @@ def _check_status():
         st.rerun()
 
 
+def _render_management_banner():
+    """Show the instance's management message while management mode is on."""
+    if not is_management_active(st.session_state.get("management")):
+        return
+
+    message = management_banner_message(st.session_state.get("management"))
+    st.sidebar.warning(
+        f"🛠️ The instance is in management mode.{f' {message}' if message else ''}",
+    )
+
+
 def _render_sidebar_navigation(cookie_me: Dict | None):
     """Render the sidebar navigation menu"""
     st.session_state["selected_page"] = st.session_state.get("selected_page")
     if not st.session_state.get("token") and not is_api_key_mode():
         st.session_state["selected_page"] = None
         return
+
+    # In management mode the backend answers 404 on every route but the
+    # mgmt_message plugin's own ones, so every other section would only show
+    # errors: System is the one that can switch the mode back off.
+    # Only once an agent is picked, though: every System entry is gated on the
+    # system agent, and the welcome screen is the only place offering the
+    # selector, so forcing the page earlier would leave an empty sidebar.
+    if is_management_active(st.session_state.get("management")) and st.session_state.get("agent_id"):
+        st.session_state["selected_page"] = "system"
 
     # Navigation menu with icons
     navigation_options = {
@@ -296,6 +319,15 @@ def _render_sidebar_navigation(cookie_me: Dict | None):
         },
     }
 
+    if is_management_active(st.session_state.get("management")):
+        navigation_options = {"menu_system": navigation_options["menu_system"]}
+        if not navigation_options["menu_system"]["⚙️ System"]["allowed"]:
+            # no agent selected, or one that cannot reach System: say so, or
+            # the sidebar would just be empty with no hint of what to do
+            st.sidebar.info(
+                f"Select the `{DEFAULT_SYSTEM_KEY}` agent to manage management mode."
+            )
+
     # Create the navigation menu
     with st.sidebar:
         # Custom title with styling
@@ -365,6 +397,11 @@ async def _main():
         st.title(WELCOME_MESSAGE)
         st.error("Grinning Cat backend is offline. Please check your connection.")
         return
+
+    # Refreshed on every run, never cached: the whole point is to notice when
+    # the mode is switched on or off, including from this very UI.
+    st.session_state["management"] = get_management_state()
+    _render_management_banner()
 
     # Assign a stable per-session key used to avoid Streamlit memoizing
     # get_local_storage() results across different browser sessions.

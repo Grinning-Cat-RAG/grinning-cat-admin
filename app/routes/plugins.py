@@ -35,7 +35,7 @@ def _image_to_base64(img_path: str) -> str:
 
 def _render_pagination_controls(section_key: str, current_page: int, total_pages: int):
     """Render pagination controls for a section."""
-    col0, col1, col2, col3, col4, col5 = st.columns([0.15, 0.08, 0.09, 0.23, 0.15, 0.3])
+    col0, col1, col2, col3, col4 = st.columns([0.20, 0.08, 0.14, 0.08, 0.3])
 
     with col1:
         if st.button("← Previous", key=f"{section_key}_prev", disabled=current_page == 0):
@@ -43,12 +43,6 @@ def _render_pagination_controls(section_key: str, current_page: int, total_pages
             st.rerun()
 
     with col2:
-        st.markdown(
-            f"<div style='text-align: center; margin-top: 0.5em;'>Page {current_page + 1} of {total_pages}</div>",
-            unsafe_allow_html=True
-        )
-
-    with col3:
         page_input = st.number_input(
             "Go to page",
             min_value=1,
@@ -58,11 +52,17 @@ def _render_pagination_controls(section_key: str, current_page: int, total_pages
             key=f"{section_key}_page_input",
             label_visibility="collapsed"
         )
+
+        st.markdown(
+            f"<div style='text-align: center; margin-top: 0.5em;'>Page {current_page + 1} of {total_pages}</div>",
+            unsafe_allow_html=True
+        )
+
         if page_input != current_page + 1:
             st.session_state[f"{section_key}_page"] = page_input - 1
             st.rerun()
 
-    with col4:
+    with col3:
         if st.button("Next →", key=f"{section_key}_next", disabled=current_page >= total_pages - 1):
             st.session_state[f"{section_key}_page"] += 1
             st.rerun()

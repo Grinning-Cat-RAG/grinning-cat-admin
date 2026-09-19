@@ -102,7 +102,7 @@ def _list_agents(cookie_me: Dict | None):
                     if st.button(
                             "Clone",
                             key=f"clone_{agent.agent_id}",
-                            help="Clone this agent and all associated data"
+                            help="Clone this agent and all associated data (check below confirmation)"
                     ):
                         pop_state_keys()
                         st.session_state["agent_to_clone"] = agent.agent_id
@@ -119,7 +119,7 @@ def _list_agents(cookie_me: Dict | None):
                     if st.button(
                             "Reset",
                             key=f"reset_{agent.agent_id}",
-                            help="Reset this agent settings and memories"
+                            help="Reset this agent settings and memories (check below confirmation)"
                     ):
                         pop_state_keys()
                         st.session_state["agent_to_reset"] = agent.agent_id
@@ -136,7 +136,7 @@ def _list_agents(cookie_me: Dict | None):
                     if st.button(
                             "Destroy",
                             key=f"destroy_{agent.agent_id}",
-                            help="Permanently destroy this agent and all associated data"
+                            help="Permanently destroy this agent and all associated data (check below confirmation)"
                     ):
                         pop_state_keys()
                         st.session_state["agent_to_destroy"] = agent.agent_id

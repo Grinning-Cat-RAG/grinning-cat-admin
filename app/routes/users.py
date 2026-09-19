@@ -157,7 +157,7 @@ def _list_users(agent_id: str, cookie_me: Dict | None):
 
             with col4:
                 if has_access("USERS", "DELETE", cookie_me):
-                    if st.button("Delete", key=f"delete_{user.id}", help="Permanently delete this item"):
+                    if st.button("Delete", key=f"delete_{user.id}", help="Permanently delete this item (check below confirmation)"):
                         st.session_state["user_to_delete"] = user
                 else:
                     st.button("Delete", key=f"delete_{user.id}", disabled=True, help="No permission to delete")

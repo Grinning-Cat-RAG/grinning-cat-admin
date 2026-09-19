@@ -161,7 +161,7 @@ def _render_installed_plugin_admins(
                 if st.button(
                         "Uninstall Plugin",
                         key=f"uninstall_{p.id}",
-                        help="Uninstall this plugin",
+                        help="Uninstall this plugin (check below confirmation)",
                 ):
                     st.session_state["plugin_to_uninstall"] = p.id
 

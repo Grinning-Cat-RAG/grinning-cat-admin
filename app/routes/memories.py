@@ -41,7 +41,7 @@ def _memory_collections(agent_id: str, cookie_me: Dict | None):
 
             with col2:
                 if has_access("MEMORY", "DELETE", cookie_me):
-                    if st.button("Delete", key=f"destroy_{collection.name}", help="Permanently destroy this collection"):
+                    if st.button("Delete", key=f"destroy_{collection.name}", help="Permanently destroy this collection (check below confirmation)"):
                         st.session_state["collection_to_delete"] = collection.name
                 else:
                     st.button(
@@ -114,7 +114,7 @@ def _view_conversation_history(agent_id: str, user_id: str, conversation_id: str
 
         with col2:
             if has_access("MEMORY", "DELETE", cookie_me):
-                if st.button("Delete", key=f"delete_{agent_id}_{user_id}_{conversation_id}"):
+                if st.button("Delete", key=f"delete_{agent_id}_{user_id}_{conversation_id}", help="Delete this conversation (check below confirmation)"):
                     pop_state_keys()
                     st.session_state["conversation_to_delete"] = True
             else:
@@ -302,7 +302,7 @@ def _edit_chat_files(agent_id: str, conversation_id: str, cookie_me: Dict | None
 
             with col3:
                 if has_access("MEMORY", "DELETE", cookie_me):
-                    if st.button("Delete", key=f"delete_{file.name}", help="Permanently delete this file"):
+                    if st.button("Delete", key=f"delete_{file.name}", help="Permanently delete this file (check below confirmation)"):
                         st.session_state["file_to_delete"] = file
                 else:
                     st.button("Delete", key=f"delete_{file.name}", disabled=True, help="You do not have permission to delete files")

@@ -1,24 +1,27 @@
 FROM python:3.13-slim-bookworm AS builder
 
-WORKDIR /app
+### ENVIRONMENT VARIABLES ###
+ENV PYTHONUNBUFFERED=1 \
+    UV_NO_CACHE=1 \
+    UV_LINK_MODE=copy \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     gcc \
     build-essential \
-    libmagic-mgc \
-    libmagic1 \
-    libmagic-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt pyproject.toml ./
+WORKDIR /app
 
-RUN pip install --no-cache-dir --prefix=/install \
-    --upgrade pip setuptools wheel
+COPY pyproject.toml uv.lock ./
 
-RUN pip install --no-cache-dir --prefix=/install \
-    -r requirements.txt
-
+RUN pip install -U pip uv && \
+    uv sync --frozen --no-install-project --no-upgrade --no-cache --no-dev --python /usr/local/bin/python3.13 && \
+    rm -rf *.egg-info /root/.cache/pip /tmp/* /var/tmp/* && \
+    uv cache clean && \
+    find ./ -type d -name __pycache__ -exec rm -rf {} +
 
 FROM python:3.13-slim-bookworm AS runner
 
@@ -29,14 +32,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libmagic-mgc \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /install /usr/local
+COPY --from=builder /app/.venv /app/.venv
 COPY . .
 
 EXPOSE 8501
 
+ENV PATH="/app/.venv/bin:$PATH"
 ENV STREAMLIT_SERVER_PORT=8501
 ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0
 ENV PYTHONPATH=/app
 
 CMD ["streamlit", "run", "app/main.py", "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true"]
-

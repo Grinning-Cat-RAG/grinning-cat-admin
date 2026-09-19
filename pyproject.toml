@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "grinning-cat-admin"
-version = "0.1.0"
+version = "1.0.0"
 description = "Python package for the Grinning Cat Admin UI"
 authors = [
     {name = "Matteo Cacciola", email = "matteo.cacciola@gmail.com"}

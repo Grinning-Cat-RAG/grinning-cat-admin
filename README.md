@@ -74,10 +74,22 @@ GRINNING_CAT_API_SECURE_CONNECTION=false
 
 The admin interface supports two ways of authenticating against Grinning Cat Core:
 
-- **Credentials**: username and password are exchanged for a JWT on the Core
-  instance. The token is kept in the browser's localStorage until its `exp`
-  claim, and the permissions of the logged-in user decide which sections are
-  reachable.
+- **Credentials**: username and password are exchanged for a JWT (plus a
+  refresh token) on the Core instance. Both are kept in the browser's
+  localStorage, and the permissions of the logged-in user decide which sections
+  are reachable. The access token is renewed automatically shortly before its
+  `exp` claim, and after a page reload once it has expired, using the
+  single-use refresh token (which is rotated at every renewal). When the
+  refresh token is refused or expires, the user is sent back to the login form.
+  With several tabs open in the same browser, the tokens stored by another tab
+  are read before every renewal, so a tab never presents an already-rotated
+  refresh token (which the Core would treat as theft). Logging out from one tab
+  logs out the others too, immediately (the Core only revokes the refresh
+  token, so the access token of the other tabs would otherwise keep working
+  until its `exp`).
+  **Logout** revokes the session on the Core instance, not only in the browser.
+  The login form reports wrong credentials and rate limiting (`429`) with a
+  readable message.
 - **API key**: set `GRINNING_CAT_API_KEY` to the `CAT_API_KEY` of your Core
   instance. The login form is skipped and every call is made with that key, so
   the whole UI is available to anyone who can reach it. Leave it unset unless

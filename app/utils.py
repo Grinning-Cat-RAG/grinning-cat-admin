@@ -1,16 +1,26 @@
 import base64
 import json
 import time
+import uuid
 from typing import Dict, Any, List, Tuple
 from grinning_cat_python_sdk.models.api.nested.plugins import PluginSettingsOutput
 from slugify import slugify
 import streamlit as st
+from requests.exceptions import HTTPError
 from grinning_cat_python_sdk import GrinningCatClient, Configuration
 from grinning_cat_python_sdk.models.api.factories import FactoryObjectSettingOutput
-from streamlit_js_eval import get_local_storage, set_local_storage, remove_local_storage
+from streamlit_js_eval import get_local_storage, set_local_storage, remove_local_storage, streamlit_js_eval
 
 from app.constants import DEFAULT_SYSTEM_KEY
 from app.env import get_env, get_env_bool
+
+REFRESH_OK = "ok"
+REFRESH_REJECTED = "rejected"  # the backend refused the refresh token (or there is none): the session is over
+REFRESH_ERROR = "error"  # transient failure: keep the session, retry on the next rerun
+REFRESH_PENDING = "pending"  # waiting for the localStorage read: end this run, the next one completes the sync
+
+# refresh this long before the access token's exp, so no request goes out with a token about to expire
+ACCESS_TOKEN_REFRESH_MARGIN_SECONDS = 30
 
 
 def get_settings(
@@ -392,11 +402,24 @@ def clear_auth_cookies():
     must still be dropped on logout.
     """
     remove_local_storage("token")
+    remove_local_storage("refresh_token")
     remove_local_storage("me")
 
 
 def is_system_agent_selected() -> bool:
     return st.session_state.get("agent_id") == DEFAULT_SYSTEM_KEY
+
+
+def _jwt_exp(token: str | None) -> int | None:
+    """The 'exp' claim (unix timestamp) of a JWT, or None if it is not a decodable JWT (e.g. an API key)."""
+    try:
+        payload = token.split(".")[1]
+        # base64url decode with padding
+        padding = "=" * (-len(payload) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(payload + padding)).get("exp")
+        return exp if isinstance(exp, int) else None
+    except Exception:
+        return None
 
 
 def _get_exp_from_jwt(token: str) -> int:
@@ -406,19 +429,17 @@ def _get_exp_from_jwt(token: str) -> int:
     decodable JWT (e.g. API-key mode), so the expiry simulation always yields a
     timestamp.
     """
-    try:
-        payload = token.split(".")[1]
-        # base64url decode with padding
-        padding = "=" * (-len(payload) % 4)
-        decoded = base64.urlsafe_b64decode(payload + padding)
-        claims = json.loads(decoded)
-        exp = claims.get("exp")
-        if isinstance(exp, int):
-            return exp
-    except Exception:
-        pass
+    exp = _jwt_exp(token)
+    if exp is not None:
+        return exp
 
     return int(time.time()) + int(get_env("GRINNING_CAT_JWT_EXPIRE_MINUTES")) * 60
+
+
+def access_token_expires_soon(token: str | None) -> bool:
+    """True if the access token is expired or about to be. Tokens without an exp claim never are."""
+    exp = _jwt_exp(token)
+    return exp is not None and exp - time.time() <= ACCESS_TOKEN_REFRESH_MARGIN_SECONDS
 
 
 def _escape_for_js_string(value: str) -> str:
@@ -434,14 +455,16 @@ def _escape_for_js_string(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
-def set_with_expiry(key: str, value: str, token: str):
+def set_with_expiry(key: str, value: str, token: str, expires_in: int | None = None):
     """
     Write a value to localStorage wrapped in an envelope:
         {"value": ..., "expire": <unix timestamp>}
     The expire timestamp is derived from the JWT exp claim so the simulated
-    expiry is aligned with the server-side token validity.
+    expiry is aligned with the server-side token validity, or from `expires_in`
+    (seconds) for values that are not JWTs, like the opaque refresh token.
     """
-    envelope = {"value": value, "expire": _get_exp_from_jwt(token)}
+    expire = int(time.time()) + expires_in if expires_in is not None else _get_exp_from_jwt(token)
+    envelope = {"value": value, "expire": expire}
     set_local_storage(key, _escape_for_js_string(json.dumps(envelope)))
 
 
@@ -512,3 +535,114 @@ def build_me_data() -> Dict:
     }
     st.session_state["me"] = me_data
     return me_data
+
+
+def _persist_tokens(tokens) -> None:
+    """Keep session_state and localStorage in sync with the tokens the backend just issued."""
+    st.session_state["token"] = tokens.access_token
+    set_with_expiry("token", tokens.access_token, tokens.access_token)
+    if tokens.refresh_token:
+        st.session_state["refresh_token"] = tokens.refresh_token
+        set_with_expiry("refresh_token", tokens.refresh_token, tokens.access_token, tokens.refresh_expires_in)
+
+
+def refresh_session() -> str:
+    """
+    Exchange the refresh token for a new access token AND a new refresh token.
+
+    The refresh token is single-use: the backend consumes it and treats a second
+    presentation as theft, closing the whole session. The rotated one therefore
+    replaces the old one in session_state and localStorage right away.
+    Returns REFRESH_OK, REFRESH_REJECTED or REFRESH_ERROR.
+    """
+    refresh_token = st.session_state.get("refresh_token")
+    if not refresh_token:
+        return REFRESH_REJECTED
+
+    try:
+        tokens = GrinningCatClient(build_client_configuration()).auth.refresh(refresh_token)
+    except HTTPError as e:
+        status = e.response.status_code if e.response is not None else None
+        # 401: expired, revoked, reused or user changed. Anything else (429, 5xx) says nothing about the session.
+        return REFRESH_REJECTED if status == 401 else REFRESH_ERROR
+    except Exception as e:
+        print(f"Error refreshing the session: {e}")
+        return REFRESH_ERROR
+
+    _persist_tokens(tokens)
+    return REFRESH_OK
+
+
+def refresh_session_synced() -> str:
+    """
+    refresh_session() for a browser with several tabs of the app open.
+
+    localStorage is shared between tabs, session_state is not: if another tab has
+    already rotated the single-use refresh token, the copy held by this one is
+    stale, and presenting it would be read by the backend as theft and close the
+    session for every tab. So the storage is read first, in two runs (the read is
+    asynchronous, like every localStorage access): the first returns
+    REFRESH_PENDING, the next one adopts whatever the other tab stored and only
+    calls the backend if that is still needed.
+    """
+    nonce = st.session_state.get("_sync_nonce")
+    if nonce is None:
+        # a new key per sync: component results are memoized per key
+        nonce = uuid.uuid4().hex
+        st.session_state["_sync_nonce"] = nonce
+        for key in ("token", "refresh_token"):
+            get_with_expiry(key, component_key=f"getLS_sync_{key}_{nonce}")
+        return REFRESH_PENDING
+
+    st.session_state.pop("_sync_nonce")
+    stored_token = get_with_expiry("token", component_key=f"getLS_sync_token_{nonce}")
+    stored_refresh_token = get_with_expiry("refresh_token", component_key=f"getLS_sync_refresh_token_{nonce}")
+
+    if stored_refresh_token:
+        if stored_refresh_token != st.session_state.get("refresh_token"):
+            # another tab took over the session, maybe logging in as somebody else: 'me' must be rebuilt
+            st.session_state.pop("me", None)
+        st.session_state["refresh_token"] = stored_refresh_token
+    if stored_token and not access_token_expires_soon(stored_token):
+        st.session_state["token"] = stored_token
+        return REFRESH_OK
+    return refresh_session()
+
+
+# Resolves when a storage event, fired by ANOTHER tab of the same browser, leaves no credentials in localStorage.
+# The expression is evaluated once per component key and the listener lives as long as the component is
+# rendered: no rerun happens until the promise resolves.
+_LOGOUT_WATCH_JS = """
+new Promise(resolve => {
+  window.addEventListener('storage', () => {
+    if (localStorage.getItem('token') === null && localStorage.getItem('refresh_token') === null) {
+      resolve(Date.now());
+    }
+  });
+})
+"""
+
+
+def logged_out_elsewhere() -> bool:
+    """
+    True once another tab of this browser has logged out.
+
+    The backend only revokes the refresh token: the access token held by the other
+    tabs stays valid until its exp, so without this they would keep working.
+    """
+    fired = streamlit_js_eval(
+        js_expressions=_LOGOUT_WATCH_JS, key=f"watch_logout_{st.session_state.get('_session_key')}"
+    )
+    return fired is not None
+
+
+def revoke_session() -> None:
+    """Best effort: ask the backend to revoke the session. Never blocks a logout."""
+    refresh_token = st.session_state.get("refresh_token")
+    if not refresh_token:
+        return
+
+    try:
+        GrinningCatClient(build_client_configuration()).auth.logout(refresh_token)
+    except Exception as e:
+        print(f"Error revoking the session: {e}")

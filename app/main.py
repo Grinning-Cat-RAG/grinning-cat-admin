@@ -9,7 +9,12 @@ from requests.exceptions import HTTPError
 from app.constants import CHECK_INTERVAL, DEFAULT_SYSTEM_KEY, WELCOME_MESSAGE
 from app.env import get_env
 from app.utils import (
+    REFRESH_OK,
+    REFRESH_PENDING,
+    REFRESH_REJECTED,
+    access_token_expires_soon,
     get_with_expiry,
+    logged_out_elsewhere,
     build_agents_options_select,
     build_client_configuration,
     build_me_data,
@@ -20,6 +25,9 @@ from app.utils import (
     is_management_active,
     is_system_agent_selected,
     management_banner_message,
+    refresh_session,
+    refresh_session_synced,
+    revoke_session,
 )
 from app.routes.agentic_workflows import agentic_workflows_management
 from app.routes.auth_handlers import auth_handlers_management
@@ -41,12 +49,25 @@ from app.routes.vector_databases import vector_databases_management
 from app.routes.welcome import welcome
 
 
-def _logout(message: str, icon: str, keep_message: bool = False):
-    """Drop the session and the persisted token, then restart the script."""
+def _logout(
+    message: str, icon: str, keep_message: bool = False, revoke: bool = True, clear_storage: bool = True
+):
+    """Revoke the session, drop the persisted tokens, then restart the script.
+
+    A logout that started in another tab passes revoke=False and clear_storage=False: the session is
+    already revoked there, and that tab may be logging in again, so removing the entries would delete
+    its new tokens.
+    """
     rejected_token = st.session_state.get("token")
+    rejected_refresh_token = st.session_state.get("refresh_token")
+
+    if revoke:
+        # before clearing: it needs the refresh token. Failures must not keep the user logged in.
+        revoke_session()
 
     st.session_state.clear()
-    clear_auth_cookies()
+    if clear_storage:
+        clear_auth_cookies()
     if keep_message:
         # Survives the clear() above; login_page() displays and pops it.
         st.session_state["auth_error"] = message
@@ -54,11 +75,38 @@ def _logout(message: str, icon: str, keep_message: bool = False):
         # the backend just refused so that a slow removal cannot feed it back
         # to us and spin the login/refuse cycle forever.
         st.session_state["rejected_token"] = rejected_token
+        st.session_state["rejected_refresh_token"] = rejected_refresh_token
 
     st.toast(message, icon=icon)
     time.sleep(1)  # let the asynchronous localStorage removal land first
 
     st.rerun()
+
+
+_SESSION_EXPIRED_MESSAGE = "Your session has expired. Please log in again."
+_LOGGED_OUT_ELSEWHERE_MESSAGE = "You have been logged out from another tab."
+
+
+def _ensure_fresh_token() -> bool:
+    """Renew the access token shortly before it expires, so the user never sees the expiry.
+
+    Returns False while the renewal is waiting for the localStorage read: the caller must end the run.
+    """
+    if not st.session_state.get("refresh_token"):
+        return True
+
+    # a sync started by a previous run must be completed, whatever the token looks like now
+    if "_sync_nonce" not in st.session_state:
+        forced = st.session_state.pop("_force_refresh", False)
+        if not forced and not access_token_expires_soon(st.session_state.get("token")):
+            return True
+
+    outcome = refresh_session_synced()
+    if outcome == REFRESH_PENDING:
+        return False
+    if outcome == REFRESH_REJECTED:
+        _logout(_SESSION_EXPIRED_MESSAGE, "⏱️", keep_message=True)
+    return True
 
 
 def _get_cookie_me() -> Dict | None:
@@ -77,14 +125,22 @@ def _get_cookie_me() -> Dict | None:
         return None
 
     try:
-        return build_me_data()
+        me = build_me_data()
+        st.session_state.pop("_renewed_after_refusal", None)
+        return me
     except HTTPError as e:
         status = e.response.status_code if e.response is not None else None
         if status in (401, 403):
+            # The token can be refused before its exp claim (clock skew, backend restarted with another
+            # secret): renew it once, on the next run, before giving up.
+            if st.session_state.get("refresh_token") and not st.session_state.get("_renewed_after_refusal"):
+                st.session_state["_force_refresh"] = True
+                st.session_state["_renewed_after_refusal"] = True
+                st.rerun()
             # The backend rejected the token: this is an expired or revoked
             # session, not an API-key one. Granting the API-key branch here
             # would show the whole admin UI to a user the backend refuses.
-            _logout("Your session has expired. Please log in again.", "⏱️", keep_message=True)
+            _logout(_SESSION_EXPIRED_MESSAGE, "⏱️", keep_message=True)
         print(f"Error rehydrating me from API: {e}")
         return None
     except Exception as e:
@@ -96,6 +152,7 @@ def _get_cookie_me() -> Dict | None:
 # Wiping them logs the user out and drops the app into the API-key branch.
 _SESSION_SCOPED_KEYS = (
     "token",
+    "refresh_token",
     "me",
     "_session_key",
     "status_connection",
@@ -412,6 +469,12 @@ async def _main():
     # If token is already in session_state this is an internal rerun (e.g.
     # post-login): skip the async localStorage cycle and go straight to the app.
     if st.session_state.get("token"):
+        if logged_out_elsewhere():
+            _logout(_LOGGED_OUT_ELSEWHERE_MESSAGE, "🚪", keep_message=True, revoke=False, clear_storage=False)
+        if not _ensure_fresh_token():
+            st.title(WELCOME_MESSAGE)
+            loading_page()
+            return
         cookie_me = _get_cookie_me()
         _render_sidebar_navigation(cookie_me)
         await _render_page(cookie_me)
@@ -423,22 +486,41 @@ async def _main():
     if not st.session_state.get("initial_auth_check_done"):
         # First render: fire the async localStorage read and show a loading screen.
         st.session_state["initial_auth_check_done"] = True
-        get_with_expiry(
-            "token", component_key=f"getLS_token_{st.session_state['_session_key']}"
-        )
+        for key in ("token", "refresh_token"):
+            get_with_expiry(key, component_key=f"getLS_{key}_{st.session_state['_session_key']}")
         st.title(WELCOME_MESSAGE)
         loading_page()
         return
 
-    # Second render: the iframe has responded; read the cached result.
+    # Second render: the iframe has responded; read the cached results.
     cookie_token = get_with_expiry(
         "token", component_key=f"getLS_token_{st.session_state['_session_key']}"
     )
+    cookie_refresh_token = get_with_expiry(
+        "refresh_token", component_key=f"getLS_refresh_token_{st.session_state['_session_key']}"
+    )
+    if cookie_refresh_token == st.session_state.get("rejected_refresh_token"):
+        cookie_refresh_token = None
+    if cookie_refresh_token:
+        st.session_state["refresh_token"] = cookie_refresh_token
+
     if cookie_token and cookie_token != st.session_state.get("rejected_token"):
         st.session_state["token"] = cookie_token
         time.sleep(0.5)
         st.rerun()
         return
+
+    # The access token is gone from localStorage once expired, but the refresh
+    # token outlives it: renew the session instead of asking for the password.
+    if cookie_refresh_token:
+        outcome = refresh_session()
+        if outcome == REFRESH_OK:
+            time.sleep(0.5)
+            st.rerun()
+            return
+        if outcome == REFRESH_REJECTED:
+            st.session_state.pop("refresh_token", None)
+            clear_auth_cookies()
 
     # No stored credentials: run against the configured API key when there is
     # one, otherwise ask for a username and password.

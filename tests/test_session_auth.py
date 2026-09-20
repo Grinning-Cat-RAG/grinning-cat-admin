@@ -256,6 +256,7 @@ def test_a_rejected_token_is_not_read_back_from_localstorage(session_state, monk
         "_session_key": "sess",
         "initial_auth_check_done": True,
         "rejected_token": "stale-token",
+        "rejected_refresh_token": "stale-token",
     })
 
     shown = []

@@ -1,6 +1,6 @@
 # Grinning Cat Admin UI
 
-A modern web-based administration interface for the [Grinning Cat Core](https://github.com/matteocacciola/grinning-cat-core) framework. This admin UI provides a user-friendly interface to manage, configure, and monitor your Grinning Cat AI assistant instances.
+A modern web-based administration interface for the [Grinning Cat Core](https://github.com/Grinning-Cat-RAG/grinning-cat-core) framework. This admin UI provides a user-friendly interface to manage, configure, and monitor your Grinning Cat AI assistant instances.
 
 ## Features
 
@@ -16,14 +16,14 @@ A modern web-based administration interface for the [Grinning Cat Core](https://
 
 - Python 3.11 or higher
 - pip and venv for dependency management
-- Running instance of [Grinning Cat Core](https://github.com/matteocacciola/grinning-cat-core)
+- Running instance of [Grinning Cat Core](https://github.com/Grinning-Cat-RAG/grinning-cat-core)
 
 ## Installation
 
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/matteocacciola/grinning-cat-admin.git
+git clone https://github.com/Grinning-Cat-RAG/grinning-cat-admin.git
 cd grinning-cat-admin
 ```
 
@@ -114,12 +114,12 @@ This project is licensed under [GPL3](LICENSE).
 
 ## Support
 
-- 🐛 [Issue Tracker](https://github.com/matteocacciola/grinning-cat-admin/issues)
+- 🐛 [Issue Tracker](https://github.com/Grinning-Cat-RAG/grinning-cat-admin/issues)
 - 📧 [Email Support](mailto:matteo.cacciola@gmail.com)
 
 ## Acknowledgments
 
-- [Grinning Cat Core](https://github.com/matteocacciola/grinning-cat-core) - The AI framework this admin interface manages
+- [Grinning Cat Core](https://github.com/Grinning-Cat-RAG/grinning-cat-core) - The AI framework this admin interface manages
 - [FastAPI](https://fastapi.tiangolo.com/) - Modern web framework for building APIs
 
 ---

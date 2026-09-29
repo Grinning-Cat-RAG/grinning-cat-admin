@@ -23,9 +23,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/matteocacciola/grinning-cat-admin"
-Repository = "https://github.com/matteocacciola/grinning-cat-admin"
-Issues = "https://github.com/matteocacciola/grinning-cat-admin/issues"
+Homepage = "https://github.com/Grinning-Cat-RAG/grinning-cat-admin"
+Repository = "https://github.com/Grinning-Cat-RAG/grinning-cat-admin"
+Issues = "https://github.com/Grinning-Cat-RAG/grinning-cat-admin/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]

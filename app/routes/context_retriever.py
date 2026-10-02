@@ -5,7 +5,6 @@ from grinning_cat_python_sdk import GrinningCatClient
 
 from app.utils import (
     get_factory_settings,
-    build_agents_select,
     run_toast,
     show_overlay_spinner,
     build_client_configuration,
@@ -14,7 +13,7 @@ from app.utils import (
 )
 
 
-def _list_context_retrievers(agent_id: str, cookie_me: Dict | None):
+def _list_context_retrievers(agent_id: str, cookie_me: Dict):
     run_toast()
 
     if not has_access("CONTEXT_RETRIEVER", "READ", cookie_me):
@@ -59,7 +58,7 @@ def _list_context_retrievers(agent_id: str, cookie_me: Dict | None):
 
 
 @st.dialog(title="Edit Context Retriever", width="large")
-def _edit_context_retriever(agent_id: str, context_retriever_name: str, is_selected: bool, cookie_me: Dict | None):
+def _edit_context_retriever(agent_id: str, context_retriever_name: str, is_selected: bool, cookie_me: Dict):
     if not has_access("CONTEXT_RETRIEVER", "WRITE", cookie_me):
         st.error("You do not have access to edit context retrievers for this agent.")
         return
@@ -108,9 +107,8 @@ def _edit_context_retriever(agent_id: str, context_retriever_name: str, is_selec
         st.rerun()
 
 
-def context_retrievers_management(cookie_me: Dict | None):
+def context_retrievers_management(cookie_me: Dict):
     st.title("Context Retrievers Management Dashboard")
 
-    build_agents_select("context_retrievers", cookie_me)
     if "agent_id" in st.session_state:
         _list_context_retrievers(st.session_state["agent_id"], cookie_me)

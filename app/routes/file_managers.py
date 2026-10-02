@@ -5,7 +5,6 @@ from grinning_cat_python_sdk import GrinningCatClient
 
 from app.utils import (
     get_factory_settings,
-    build_agents_select,
     run_toast,
     show_overlay_spinner,
     build_client_configuration,
@@ -14,7 +13,7 @@ from app.utils import (
 )
 
 
-def _list_file_managers(agent_id: str, cookie_me: Dict | None):
+def _list_file_managers(agent_id: str, cookie_me: Dict):
     run_toast()
 
     if not has_access("FILE_MANAGER", "READ", cookie_me):
@@ -59,7 +58,7 @@ def _list_file_managers(agent_id: str, cookie_me: Dict | None):
 
 
 @st.dialog(title="Edit File Manager", width="large")
-def _edit_file_manager(agent_id: str, file_manager_name: str, is_selected: bool, cookie_me: Dict | None):
+def _edit_file_manager(agent_id: str, file_manager_name: str, is_selected: bool, cookie_me: Dict):
     if not has_access("FILE_MANAGER", "WRITE", cookie_me):
         st.error("You do not have access to edit file managers for this agent.")
         return
@@ -108,11 +107,10 @@ def _edit_file_manager(agent_id: str, file_manager_name: str, is_selected: bool,
         st.rerun()
 
 
-def file_managers_management(cookie_me: Dict | None):
+def file_managers_management(cookie_me: Dict):
     st.title("File Managers Management Dashboard")
 
     st.info("**Disclaimer**: a File Manager is used to store the files of the Knowledge Base.")
 
-    build_agents_select("file_managers", cookie_me)
     if "agent_id" in st.session_state:
         _list_file_managers(st.session_state["agent_id"], cookie_me)

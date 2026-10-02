@@ -5,7 +5,6 @@ from grinning_cat_python_sdk import GrinningCatClient
 
 from app.utils import (
     get_factory_settings,
-    build_agents_select,
     run_toast,
     show_overlay_spinner,
     build_client_configuration,
@@ -14,7 +13,7 @@ from app.utils import (
 )
 
 
-def _list_vector_databases(agent_id: str, cookie_me: Dict | None):
+def _list_vector_databases(agent_id: str, cookie_me: Dict):
     run_toast()
 
     if not has_access("VECTOR_DATABASE", "READ", cookie_me):
@@ -59,7 +58,7 @@ def _list_vector_databases(agent_id: str, cookie_me: Dict | None):
 
 
 @st.dialog(title="Edit Vector Database", width="large")
-def _edit_vector_database(agent_id: str, vector_database_name: str, is_selected: bool, cookie_me: Dict | None):
+def _edit_vector_database(agent_id: str, vector_database_name: str, is_selected: bool, cookie_me: Dict):
     if not has_access("VECTOR_DATABASE", "WRITE", cookie_me):
         st.error("You do not have access to edit vector databases for this agent.")
         return
@@ -108,9 +107,8 @@ def _edit_vector_database(agent_id: str, vector_database_name: str, is_selected:
         st.rerun()
 
 
-def vector_databases_management(cookie_me: Dict | None):
+def vector_databases_management(cookie_me: Dict):
     st.title("Vector Databases Management Dashboard")
 
-    build_agents_select("vector_databases", cookie_me)
     if "agent_id" in st.session_state:
         _list_vector_databases(st.session_state["agent_id"], cookie_me)

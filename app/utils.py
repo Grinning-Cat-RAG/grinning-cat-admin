@@ -88,26 +88,23 @@ def get_factory_settings(
     return values, types
 
 
-def build_agents_options_select(cookie_me: Dict | None, excluded_agents: List[str] | None = None) -> Dict[str, str]:
-    if cookie_me:  # login by credentials
-        agents = [agent["agent_name"] for agent in cookie_me.get("agents", [])]
-    else:  # login by API key
-        client = GrinningCatClient(build_client_configuration())
-        agents = [agent.agent_id for agent in client.utils.get_agents()]
+def _get_all_agents_names(cookie_me: Dict) -> List[str]:
+    return [agent["agent_name"] for agent in cookie_me.get("agents", [])]
 
+
+def build_agents_options_select(cookie_me: Dict, excluded_agents: List[str] | None = None) -> Dict[str, str]:
+    agents = _get_all_agents_names(cookie_me)
     return {
         agent: slugify(agent) for agent in agents if agent not in (excluded_agents or [])
     }
 
 
-def build_agents_select(k: str, cookie_me: Dict | None, force_system_agent: bool = False):
-    if st.session_state.get("agent_id") is not None and cookie_me is not None:
+def build_agents_select(k: str, cookie_me: Dict):
+    if st.session_state.get("agent_id") is not None:
         return  # already selected and logged by credentials
 
     # Navigation
     agent_options = build_agents_options_select(cookie_me)
-    if force_system_agent and DEFAULT_SYSTEM_KEY not in agent_options:
-        agent_options = {DEFAULT_SYSTEM_KEY: slugify(DEFAULT_SYSTEM_KEY)} | agent_options
     if len(agent_options) == 0:
         st.info("No agents found. Please create an agent first.")
         return
@@ -125,17 +122,15 @@ def build_agents_select(k: str, cookie_me: Dict | None, force_system_agent: bool
     st.session_state["agent_id"] = choice
 
 
-def build_users_select(k: str, agent_id: str, cookie_me: Dict | None):
-    if st.session_state.get("user_id") is not None and cookie_me is not None:
-        return  # already selected
-
-    if cookie_me:  # login by credentials
-        agent_match = next((agent for agent in cookie_me.get("agents", []) if agent.get("agent_name") == agent_id), None)
-        if not agent_match:
-            st.error("Agent not found in user data.")
-            return
-        st.session_state["user_id"] = agent_match.get("user", {}).get("id")
+def build_users_select(k: str, agent_id: str, cookie_me: Dict):
+    agents = _get_all_agents_names(cookie_me)
+    if agent_id not in agents and agent_id != DEFAULT_SYSTEM_KEY:
+        st.error("Agent not found in user data.")
         return
+
+    st.session_state["conversation_user_id"] = st.session_state.get("user_id") if DEFAULT_SYSTEM_KEY not in agents else None
+    if st.session_state.get("conversation_user_id") is not None:
+        return  # already selected
 
     client = GrinningCatClient(build_client_configuration())
     users = client.users.get_users(agent_id)
@@ -145,10 +140,10 @@ def build_users_select(k: str, agent_id: str, cookie_me: Dict | None):
     choice = st.selectbox("Users", menu_options, key=f"user_select_{k}")
     if menu_options[choice] is None:
         st.info("Please select an user to manage.")
-        st.session_state.pop("user_id", None)
+        st.session_state.pop("conversation_user_id", None)
         return
 
-    st.session_state["user_id"] = menu_options[choice]
+    st.session_state["conversation_user_id"] = menu_options[choice]
 
 
 def build_conversations_select(k: str, agent_id: str, user_id: str):
@@ -157,7 +152,7 @@ def build_conversations_select(k: str, agent_id: str, user_id: str):
 
     if not conversations:
         st.info("No conversations found for this user.")
-        st.session_state.pop("user_id", None)
+        st.session_state.pop("conversation_user_id", None)
         st.session_state.pop("conversation_id", None)
         return
 
@@ -166,7 +161,7 @@ def build_conversations_select(k: str, agent_id: str, user_id: str):
     }
     if not useful_conversations:
         st.info("No conversations found for this user.")
-        st.session_state.pop("user_id", None)
+        st.session_state.pop("conversation_user_id", None)
         st.session_state.pop("conversation_id", None)
         return
 
@@ -371,11 +366,8 @@ def render_json_form(data: Dict, types: Dict, prefix: str = "") -> Dict:
     return result
 
 
-def has_access(resource: str, required_role: str | None, cookie_me: Dict | None, only_admin: bool | None = False) -> bool:
+def has_access(resource: str, required_role: str | None, cookie_me: Dict, only_admin: bool | None = False) -> bool:
     """Check if the logged-in user has the required role."""
-    if not cookie_me: # logged by API key
-        return True
-
     agent_id = st.session_state.get("agent_id")
     if not agent_id:
         return False

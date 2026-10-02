@@ -5,7 +5,7 @@ import streamlit as st
 from grinning_cat_python_sdk import GrinningCatClient
 
 from app.constants import DEFAULT_SYSTEM_KEY
-from app.utils import build_agents_select, show_overlay_spinner, build_client_configuration, run_toast, has_access
+from app.utils import show_overlay_spinner, build_client_configuration, run_toast, has_access
 
 
 def _sanitize_selected_permissions(permissions: Dict[str, List[str]]) -> Dict[str, List[str]]:
@@ -38,7 +38,7 @@ def _sanitize_retrieved_permissions(permissions: Dict[str, List[str]], agent_key
     return sanitized_permissions
 
 
-def _create_user(agent_id: str, cookie_me: Dict | None):
+def _create_user(agent_id: str, cookie_me: Dict):
     run_toast()
 
     if not has_access("USERS", "WRITE", cookie_me):
@@ -119,7 +119,7 @@ def _create_user(agent_id: str, cookie_me: Dict | None):
             spinner_container.empty()
 
 
-def _list_users(agent_id: str, cookie_me: Dict | None):
+def _list_users(agent_id: str, cookie_me: Dict):
     run_toast()
 
     if not has_access("USERS", "READ", cookie_me):
@@ -195,7 +195,7 @@ def _list_users(agent_id: str, cookie_me: Dict | None):
 
 
 @st.dialog(title="User Details", width="large")
-def _get_user(agent_id: str, user_id: str, cookie_me: Dict | None):
+def _get_user(agent_id: str, user_id: str, cookie_me: Dict):
     if not has_access("USERS", "READ", cookie_me):
         st.error("You do not have permission to view user details.")
         return
@@ -211,7 +211,7 @@ def _get_user(agent_id: str, user_id: str, cookie_me: Dict | None):
 
 
 @st.dialog(title="Update Details", width="large")
-def _update_user(agent_id: str, user_id: str, cookie_me: Dict | None):
+def _update_user(agent_id: str, user_id: str, cookie_me: Dict):
     if not has_access("USERS", "WRITE", cookie_me):
         st.error("You do not have permission to update users.")
         return
@@ -296,10 +296,9 @@ def _update_user(agent_id: str, user_id: str, cookie_me: Dict | None):
 
 
 # Streamlit UI
-def users_management(cookie_me: Dict | None):
+def users_management(cookie_me: Dict):
     st.title("User Management Dashboard")
 
-    build_agents_select("users", cookie_me)
     if not (agent_id := st.session_state.get("agent_id")):
         return
 

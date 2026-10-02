@@ -167,7 +167,7 @@ def _reset_agent_scoped_state():
     st.session_state.update(preserved)
 
 
-def _build_agents_toggle_select(k: str, cookie_me: Dict | None):
+def _build_agents_toggle_select(k: str, cookie_me: Dict):
     excluded_agents = []
     if st.session_state.get("agent_id") is not None:
         excluded_agents.append(st.session_state["agent_id"])
@@ -281,7 +281,7 @@ def _render_management_banner():
     )
 
 
-def _render_sidebar_navigation(cookie_me: Dict | None):
+def _render_sidebar_navigation(cookie_me: Dict):
     """Render the sidebar navigation menu"""
     st.session_state["selected_page"] = st.session_state.get("selected_page")
     if not st.session_state.get("token") and not is_api_key_mode():
@@ -533,7 +533,7 @@ async def _main():
     login_page()
 
 
-async def _render_page(cookie_me: Dict | None):
+async def _render_page(cookie_me: Dict):
     """Dispatch to the correct page based on selected_page."""
     current_page = st.session_state["selected_page"]
 

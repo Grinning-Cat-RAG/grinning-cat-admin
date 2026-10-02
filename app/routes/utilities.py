@@ -19,7 +19,7 @@ from app.utils import (
 from app.constants import DEFAULT_SYSTEM_KEY
 
 
-def _factory_reset(cookie_me: Dict | None):
+def _factory_reset(cookie_me: Dict):
     run_toast()
 
     if not has_access("SYSTEM", "DELETE", cookie_me, only_admin=True):
@@ -58,7 +58,7 @@ def _factory_reset(cookie_me: Dict | None):
         spinner_container.empty()
 
 
-def _list_agents(cookie_me: Dict | None):
+def _list_agents(cookie_me: Dict):
     def pop_state_keys():
         for key in ["agent_to_clone", "agent_to_reset", "agent_to_destroy", "new_agent_id_input"]:
             if key in st.session_state:
@@ -241,7 +241,7 @@ def _list_agents(cookie_me: Dict | None):
         st.error(f"Error fetching agents: {e}")
 
 
-def _create_agent(cookie_me: Dict | None):
+def _create_agent(cookie_me: Dict):
     run_toast()
 
     if not has_access("CHESHIRE_CAT", "WRITE", cookie_me, only_admin=True):
@@ -290,7 +290,7 @@ def _create_agent(cookie_me: Dict | None):
 
 
 @st.dialog(title="Update Details", width="large")
-def _update_agent(agent_id: str, metadata: Dict, cookie_me: Dict | None):
+def _update_agent(agent_id: str, metadata: Dict, cookie_me: Dict):
     if not has_access("CHESHIRE_CAT", "WRITE", cookie_me):
         st.error("You do not have permission to update agents.")
         return
@@ -332,7 +332,7 @@ def _update_agent(agent_id: str, metadata: Dict, cookie_me: Dict | None):
             st.rerun()
 
 
-def _management_mode(cookie_me: Dict | None):
+def _management_mode(cookie_me: Dict):
     run_toast()
 
     if not has_access("SYSTEM", "WRITE", cookie_me, only_admin=True):
@@ -398,7 +398,7 @@ def _management_mode(cookie_me: Dict | None):
             st.rerun()
 
 
-def utilities_management(cookie_me: Dict | None):
+def utilities_management(cookie_me: Dict):
     st.title("System Management Dashboard")
 
     # Navigation

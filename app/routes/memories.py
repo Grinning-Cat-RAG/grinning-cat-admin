@@ -4,7 +4,6 @@ import streamlit as st
 from grinning_cat_python_sdk import GrinningCatClient
 
 from app.utils import (
-    build_agents_select,
     build_client_configuration,
     build_conversations_select,
     build_users_select,
@@ -14,7 +13,7 @@ from app.utils import (
 )
 
 
-def _memory_collections(agent_id: str, cookie_me: Dict | None):
+def _memory_collections(agent_id: str, cookie_me: Dict):
     run_toast()
 
     if not has_access("MEMORY", "READ", cookie_me):
@@ -83,7 +82,7 @@ def _memory_collections(agent_id: str, cookie_me: Dict | None):
         st.error(f"Error fetching memory collections: {e}")
 
 
-def _view_conversation_history(agent_id: str, user_id: str, conversation_id: str, cookie_me: Dict | None):
+def _view_conversation_history(agent_id: str, user_id: str, conversation_id: str, cookie_me: Dict):
     def pop_state_keys():
         for key in ["conversation_to_change_name", "conversation_to_delete"]:
             if key in st.session_state:
@@ -232,7 +231,7 @@ def _view_conversation_history(agent_id: str, user_id: str, conversation_id: str
 
 
 @st.dialog(title="Edit Vector Database", width="large")
-def _edit_chat_files(agent_id: str, conversation_id: str, cookie_me: Dict | None):
+def _edit_chat_files(agent_id: str, conversation_id: str, cookie_me: Dict):
     def download_file(file_name):
         try:
             response = client.file_manager.get_file(agent_id, file_name)
@@ -343,10 +342,9 @@ def _edit_chat_files(agent_id: str, conversation_id: str, cookie_me: Dict | None
 
 
 # Streamlit UI
-def memory_management(cookie_me: Dict | None):
+def memory_management(cookie_me: Dict):
     st.title("Memory Management Dashboard")
 
-    build_agents_select("memory", cookie_me)
     if not (agent_id := st.session_state.get("agent_id")):
         return
 
@@ -385,7 +383,7 @@ def memory_management(cookie_me: Dict | None):
 
     if menu_options[choice]["page"] == "view_conversation_history":
         build_users_select("memory", agent_id, cookie_me)
-        if not (user_id := st.session_state.get("user_id")):
+        if not (user_id := st.session_state.get("conversation_user_id")):
             return
 
         build_conversations_select("memory", agent_id, user_id)

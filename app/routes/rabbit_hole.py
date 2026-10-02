@@ -6,10 +6,10 @@ import streamlit as st
 from grinning_cat_python_sdk import GrinningCatClient
 import json
 
-from app.utils import build_agents_select, show_overlay_spinner, build_client_configuration, has_access, run_toast
+from app.utils import show_overlay_spinner, build_client_configuration, has_access, run_toast
 
 
-def _upload_files(agent_id: str, cookie_me: Dict | None):
+def _upload_files(agent_id: str, cookie_me: Dict):
     def add_file_pair():
         st.session_state["file_metadata_pairs"].append({"file": None, "metadata": "{}"})
 
@@ -125,7 +125,7 @@ def _upload_files(agent_id: str, cookie_me: Dict | None):
                     pass  # Ignore cleanup errors
 
 
-def _upload_url(agent_id: str, cookie_me: Dict | None):
+def _upload_url(agent_id: str, cookie_me: Dict):
     run_toast()
 
     if not has_access("UPLOAD", "WRITE", cookie_me):
@@ -168,7 +168,7 @@ def _upload_url(agent_id: str, cookie_me: Dict | None):
             spinner_container.empty()
 
 
-def _list_files(agent_id: str, cookie_me: Dict | None):
+def _list_files(agent_id: str, cookie_me: Dict):
     def download_file(file_name):
         try:
             response = client.file_manager.get_file(agent_id, file_name)
@@ -283,12 +283,11 @@ def _list_files(agent_id: str, cookie_me: Dict | None):
         st.toast(f"Error fetching files: {e}", icon="❌")
 
 
-def rabbit_hole_management(cookie_me: Dict | None):
+def rabbit_hole_management(cookie_me: Dict):
     st.title("Knowledge Base Management")
 
     st.info("**Disclaimer**: If you want to store the files of the Knowledge Base to a specific file manager, please select one in the **File Managers** section.")
 
-    build_agents_select("rabbit_hole", cookie_me)
     if not (agent_id := st.session_state.get("agent_id")):
         return
 

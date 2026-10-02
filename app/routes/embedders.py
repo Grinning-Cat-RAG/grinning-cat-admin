@@ -13,7 +13,7 @@ from app.utils import (
 )
 
 
-def _list_embedders(cookie_me: Dict | None):
+def _list_embedders(cookie_me: Dict):
     run_toast()
 
     if not has_access("EMBEDDER", "READ", cookie_me, only_admin=True):
@@ -58,7 +58,7 @@ def _list_embedders(cookie_me: Dict | None):
 
 
 @st.dialog(title="Edit Embedder", width="large")
-def _edit_embedder(embedder_name: str, is_selected: bool, cookie_me: Dict | None):
+def _edit_embedder(embedder_name: str, is_selected: bool, cookie_me: Dict):
     if not has_access("EMBEDDER", "WRITE", cookie_me, only_admin=True):
         st.error("You do not have access to edit embedders.")
         return
@@ -106,7 +106,7 @@ def _edit_embedder(embedder_name: str, is_selected: bool, cookie_me: Dict | None
         st.rerun()
 
 
-def embedders_management(cookie_me: Dict | None):
+def embedders_management(cookie_me: Dict):
     st.title("Embedders Management Dashboard")
 
     _list_embedders(cookie_me)

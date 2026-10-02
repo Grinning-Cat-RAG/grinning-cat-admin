@@ -16,7 +16,6 @@ from app.utils import (
     build_client_configuration,
     render_json_form,
     has_access,
-    build_agents_select,
 )
 
 # Pagination settings
@@ -105,7 +104,7 @@ def _render_installed_plugin_common_parts(col0, col1, p):
             st.json(p.model_dump())
 
 
-def _render_installed_plugin_agents(p, untoggling_plugins_ids: List[str], cookie_me: Dict | None):
+def _render_installed_plugin_agents(p, untoggling_plugins_ids: List[str], cookie_me: Dict):
     """Render a single installed plugin row."""
     col0, col1, col2 = st.columns([0.05, 0.63, 0.32])
 
@@ -123,7 +122,7 @@ def _render_installed_plugin_admins(
     p,
     client: GrinningCatClient,
     untoggling_plugins_ids: List[str],
-    cookie_me: Dict | None,
+    cookie_me: Dict,
     core_plugins_ids: List[str] | None = None,
 ):
     """Render a single installed plugin row."""
@@ -166,7 +165,7 @@ def _render_installed_plugin_admins(
                     st.session_state["plugin_to_uninstall"] = p.id
 
 
-def _list_plugins(cookie_me: Dict | None):
+def _list_plugins(cookie_me: Dict):
     run_toast()
 
     if not has_access("PLUGIN", "READ", cookie_me):
@@ -175,8 +174,6 @@ def _list_plugins(cookie_me: Dict | None):
 
     st.header("Available Plugins")
 
-    force_system = not cookie_me
-    build_agents_select("plugins", cookie_me, force_system_agent=force_system)
     if "agent_id" not in st.session_state:
         return
 
@@ -184,17 +181,10 @@ def _list_plugins(cookie_me: Dict | None):
     search_query = st.text_input("Search plugins", "")
 
     client = GrinningCatClient(build_client_configuration())
-
-    if st.session_state.get("agent_id") == DEFAULT_SYSTEM_KEY:
-        _list_plugins_admins(client, search_query, cookie_me)
-        if force_system:
-            st.session_state.pop("agent_id", None)
-        return
-
     _list_plugins_agents(client, search_query, cookie_me)
 
 
-def _list_plugins_agents(client: GrinningCatClient, search_query: str, cookie_me: Dict | None):
+def _list_plugins_agents(client: GrinningCatClient, search_query: str, cookie_me: Dict):
     if not (agent_id := st.session_state.get("agent_id")):
         return
 
@@ -205,7 +195,7 @@ def _list_plugins_agents(client: GrinningCatClient, search_query: str, cookie_me
         st.error(f"Error fetching plugins: {e}")
 
 
-def _list_plugins_admins(client: GrinningCatClient, search_query: str, cookie_me: Dict | None):
+def _list_plugins_admins(client: GrinningCatClient, search_query: str, cookie_me: Dict):
     try:
         plugins = client.admins.get_available_plugins(plugin_name=search_query)
         core_plugins_ids = client.custom.get_custom("/admins/core_plugins", DEFAULT_SYSTEM_KEY)
@@ -302,7 +292,7 @@ def _list_plugins_admins(client: GrinningCatClient, search_query: str, cookie_me
 def _list_plugins_installed(
     client: GrinningCatClient,
     plugins: PluginCollectionOutput,
-    cookie_me: Dict | None,
+    cookie_me: Dict,
     core_plugins_ids: List[str] | None = None,
 ):
     if not plugins:
@@ -531,7 +521,7 @@ def _install_plugin_from_file():
             st.toast("Please select a file to upload", icon="⚠️")
 
 
-def plugins_management(cookie_me: Dict | None):
+def plugins_management(cookie_me: Dict):
     st.title("Plugins Management Dashboard")
 
     # Navigation

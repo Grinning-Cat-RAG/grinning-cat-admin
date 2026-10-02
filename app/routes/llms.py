@@ -5,7 +5,6 @@ from grinning_cat_python_sdk import GrinningCatClient
 
 from app.utils import (
     get_factory_settings,
-    build_agents_select,
     run_toast,
     show_overlay_spinner,
     build_client_configuration,
@@ -14,7 +13,7 @@ from app.utils import (
 )
 
 
-def _list_llms(agent_id: str, cookie_me: Dict | None):
+def _list_llms(agent_id: str, cookie_me: Dict):
     run_toast()
 
     if not has_access("LLM", "READ", cookie_me):
@@ -59,7 +58,7 @@ def _list_llms(agent_id: str, cookie_me: Dict | None):
 
 
 @st.dialog(title="Edit LLM", width="large")
-def _edit_llm(agent_id: str, llm_name: str, is_selected: bool, cookie_me: Dict | None):
+def _edit_llm(agent_id: str, llm_name: str, is_selected: bool, cookie_me: Dict):
     if not has_access("LLM", "WRITE", cookie_me):
         st.error("You do not have access to edit LLMs for this agent.")
         return
@@ -108,9 +107,8 @@ def _edit_llm(agent_id: str, llm_name: str, is_selected: bool, cookie_me: Dict |
         st.rerun()
 
 
-def llms_management(cookie_me: Dict | None):
+def llms_management(cookie_me: Dict):
     st.title("LLMs Management Dashboard")
 
-    build_agents_select("llms", cookie_me)
     if "agent_id" in st.session_state:
         _list_llms(st.session_state["agent_id"], cookie_me)

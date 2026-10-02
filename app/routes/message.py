@@ -5,10 +5,10 @@ from grinning_cat_python_sdk import GrinningCatClient
 from grinning_cat_python_sdk.models.dtos import Message
 
 from app.constants import INTRO_MESSAGE
-from app.utils import build_agents_select, build_users_select, build_client_configuration, has_access, run_toast
+from app.utils import build_client_configuration, has_access, run_toast
 
 
-async def chat(cookie_me: Dict | None):
+async def chat(cookie_me: Dict):
     run_toast()
 
     st.header("Chat with the GrinningCat")
@@ -17,11 +17,9 @@ async def chat(cookie_me: Dict | None):
         st.error("You do not have permission to access the chat functionality.")
         return
 
-    build_agents_select("chat", cookie_me)
     if not (agent_id := st.session_state.get("agent_id")):
         return
 
-    build_users_select("chat", agent_id, cookie_me)
     if not (user_id := st.session_state.get("user_id")):
         return
 

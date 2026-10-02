@@ -5,7 +5,7 @@ from app.constants import WELCOME_MESSAGE
 from app.utils import build_agents_select
 
 
-def welcome(cookie_me: Dict | None):
+def welcome(cookie_me: Dict):
     # show a welcome message if no page is selected
     st.title(WELCOME_MESSAGE)
     if cookie_me and not st.session_state.get("agent_id"):

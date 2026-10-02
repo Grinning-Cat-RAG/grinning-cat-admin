@@ -1,5 +1,7 @@
 # Grinning Cat Admin UI
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Grinning-Cat-RAG/grinning-cat-admin)
+
 A modern web-based administration interface for the [Grinning Cat Core](https://github.com/Grinning-Cat-RAG/grinning-cat-core) framework. This admin UI provides a user-friendly interface to manage, configure, and monitor your Grinning Cat AI assistant instances.
 
 ## Features

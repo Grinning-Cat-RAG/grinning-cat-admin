@@ -34,7 +34,6 @@ from app.routes.auth_handlers import auth_handlers_management
 from app.routes.chunkers import chunkers_management
 from app.routes.context_retriever import context_retrievers_management
 from app.routes.embedders import embedders_management
-from app.routes.ingestion import ingestion_management
 from app.routes.file_managers import file_managers_management
 from app.routes.llms import llms_management
 from app.routes.loading import loading_page
@@ -332,10 +331,6 @@ def _render_sidebar_navigation(cookie_me: Dict):
                 "page": "embedders",
                 "allowed": has_access("EMBEDDER", None, cookie_me, only_admin=True),
             },
-            "⚙️ Ingestion": {
-                "page": "ingestion",
-                "allowed": has_access("SYSTEM", None, cookie_me, only_admin=True),
-            },
         },
         "menu_data": {
             "🔪 Chunkers": {
@@ -566,10 +561,6 @@ async def _render_page(cookie_me: Dict):
 
     if current_page == "embedders":
         embedders_management(cookie_me)
-        return
-
-    if current_page == "ingestion":
-        ingestion_management(cookie_me)
         return
 
     if current_page == "file_handlers":

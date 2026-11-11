@@ -5,3 +5,6 @@ enableXsrfProtection = true
 [runner]
 # Reduce memory usage if needed
 fastReruns = true
+
+[browser]
+gatherUsageStats = false

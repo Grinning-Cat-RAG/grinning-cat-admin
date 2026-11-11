@@ -195,14 +195,22 @@ def _apply_custom_css():
 
 /* If the above doesn't work, try these selectors */
 #stDeployButton {display: none;}
-button[kind="header"] {display: none;}
-div[data-testid="stToolbar"] {display: none;}
+div[data-testid="stToolbar"] {display: flex !important; visibility: visible !important;}
 div[data-testid="stDecoration"] {display: none;}
 div[data-testid="stStatusWidget"] {display: none;}
 
 /* Hide the hamburger menu too */
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
+
+/* Streamlit 1.67: the collapsed-sidebar expand arrow */
+div[data-testid="stToolbar"] [data-testid="stExpandSidebarButton"],
+button[kind="headerNoPadding"][data-testid="stExpandSidebarButton"] {
+    display: flex !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    pointer-events: auto !important;
+}
 """
 
     st.markdown(f"""

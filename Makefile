@@ -30,6 +30,11 @@ dev:
 	uv pip compile -U -o requirements.txt pyproject.toml
 	docker buildx build . -f Dockerfile:dhi -t grinning-cat-admin:dev
 
+dhi: ## Build the DHI multi-stage image
+	docker pull dhi.io/python:3.13
+	docker pull dhi.io/python:3.13-dev
+	docker buildx build . -f Dockerfile:dhi -t grinning-cat-admin:dhi .
+
 test: ## Run the test suite.
 	@$(PYTHON) -m pytest
 

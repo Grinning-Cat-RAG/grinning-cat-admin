@@ -1,5 +1,4 @@
 """The prod CSS must keep the sidebar expand control visible on Streamlit 1.67."""
-import pytest
 import streamlit as st
 
 from app import main

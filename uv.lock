@@ -284,7 +284,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "grinning-cat-python-sdk", specifier = ">=1.0.5" },
+    { name = "grinning-cat-python-sdk", specifier = ">=1.0.6" },
     { name = "msgpack", specifier = ">=1.2.1,<=2.0.0" },
     { name = "python-dotenv", specifier = ">=1.2.0,<=2.0.0" },
     { name = "python-slugify", specifier = ">=8.0.0,<=9.0.0" },
@@ -302,7 +302,7 @@ dev = [
 
 [[package]]
 name = "grinning-cat-python-sdk"
-version = "1.0.5"
+version = "1.0.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
@@ -312,9 +312,9 @@ dependencies = [
     { name = "requests-toolbelt" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b7/ff/a3e529a24eade5637e7ebf86a0e97e42498e754c2c115852dae717530154/grinning_cat_python_sdk-1.0.5.tar.gz", hash = "sha256:0658c03d8594490c14ff996c6598397ac3d4d4d07360c9c2a680b9e1e648e95a", size = 43957, upload-time = "2026-09-20T12:06:56.616Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/74/69/736266ac925731808825b30ea2d7f2cf8140c71c8d34ba5661c72bc96754/grinning_cat_python_sdk-1.0.6.tar.gz", hash = "sha256:868d37713e36cfc9835be82b64b0e9d7aeabddfad916dd20a419cfdaf3e45209", size = 45481, upload-time = "2026-11-12T23:46:54.35Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ac/3c/a9a87316a1cbc930dc8c32e0bb649f1e693b44c13a7dbc1220fb46e10714/grinning_cat_python_sdk-1.0.5-py3-none-any.whl", hash = "sha256:59377791bbdcd96d8cf555ae02d086a5eb879526aa687df4dfc940557ef5e33b", size = 62609, upload-time = "2026-09-20T12:06:55.044Z" },
+    { url = "https://files.pythonhosted.org/packages/0c/01/f6d7acbd6f2c08fa2afd8fd8ce5f564d42f1073363cfd59f47db7d09d6b6/grinning_cat_python_sdk-1.0.6-py3-none-any.whl", hash = "sha256:10501952db36b8a3c40e58b61f9d4835aecb2b9cc914297f5484e2810db18ee4", size = 62277, upload-time = "2026-11-12T23:46:52.748Z" },
 ]
 
 [[package]]

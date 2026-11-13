@@ -1,0 +1,50 @@
+# syntax=docker/dockerfile:1
+
+FROM dhi.io/python:3.13-dev AS builder
+
+ENV PYTHONUNBUFFERED=1 \
+    UV_NO_CACHE=1 \
+    UV_LINK_MODE=copy \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libmagic1 \
+        git \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m pip install --no-cache-dir --root-user-action=ignore uv
+
+RUN mkdir -p /export-libs \
+    && cp -a /usr/lib/*/libmagic.so.* /export-libs/
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+
+RUN uv sync --frozen --no-install-project --no-dev
+
+COPY app/ ./app/
+COPY .streamlit/ ./.streamlit/
+
+RUN find /app -type d -name __pycache__ -prune -exec rm -rf {} + \
+    && find /app -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+
+FROM dhi.io/python:3.13 AS runtime
+
+WORKDIR /app
+
+COPY --from=builder /export-libs/ /export-libs/
+COPY --from=builder /usr/lib/file/magic.mgc /usr/share/file/magic.mgc
+COPY --from=builder /app /app
+
+ENV STREAMLIT_SERVER_PORT=8501 \
+    STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
+    PYTHONPATH=/app \
+    MAGIC=/usr/share/file/magic.mgc \
+    LD_LIBRARY_PATH=/export-libs \
+    PATH="/app/.venv/bin:$PATH"
+
+EXPOSE 8501
+
+CMD ["streamlit", "run", "app/main.py", "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true"]

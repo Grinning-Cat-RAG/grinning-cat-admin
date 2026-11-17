@@ -66,6 +66,7 @@ def test_help_lists_every_flag(capsys):
         "--backup-out",
         "--restore",
         "--allow-system-wide",
+        "--allow-agent-mismatch",
         "--max-workers",
         "--reload-dir",
     ):
@@ -1028,6 +1029,161 @@ def test_invalid_patch_shape_exits_2_without_calls(tmp_path, capsys):
     assert excinfo.value.code == 2
     assert "gpt-4" in capsys.readouterr().err
     assert client.calls == []
+
+
+# --- Refuse a per-agent dump applied to another agent ----------------------
+
+
+def _write_dump_patch(directory, agent_id, payload):
+    """Write a patch file with the real dump header for ``agent_id``."""
+    path = Path(directory) / f"{agent_id}.yml"
+    header = cli._dump_header(
+        agent_id,
+        cli._agent_role(agent_id),
+        list(payload),
+        {},
+        [],
+        "host",
+        "omitted",
+        [],
+    )
+    path.write_text(cli._render_dump_yaml(payload, header), encoding="utf-8")
+    return path
+
+
+def test_patch_agent_id_reads_the_dump_header(tmp_path):
+    path = _write_dump_patch(tmp_path, "qwen", {"metadata": {"label": "q"}})
+
+    assert cli._patch_agent_id(str(path)) == "qwen"
+
+
+def test_patch_agent_id_tolerates_spacing_and_leading_comment(tmp_path):
+    path = tmp_path / "spaced.yml"
+    path.write_text(
+        "# dump-format: patch-v1\n#   agent-id:   qwen   \nmetadata:\n  label: q\n",
+        encoding="utf-8",
+    )
+
+    assert cli._patch_agent_id(str(path)) == "qwen"
+
+
+def test_patch_agent_id_returns_none_for_a_generic_patch(tmp_path):
+    path = tmp_path / "generic.yml"
+    path.write_text("metadata:\n  label: q\n", encoding="utf-8")
+
+    assert cli._patch_agent_id(str(path)) is None
+
+
+def test_patch_agent_id_returns_none_for_a_missing_file(tmp_path):
+    assert cli._patch_agent_id(str(tmp_path / "missing.yml")) is None
+
+
+def test_patch_dump_for_another_agent_exits_2_before_the_client(tmp_path, capsys):
+    dump = _write_dump_patch(tmp_path, "qwen", {"metadata": {"label": "q"}})
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(
+            ["--agent", "__widget_django__", "--patch", str(dump), "--yes"],
+            client_factory=_forbidden_factory,
+        )
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert str(dump) in err
+    assert "qwen" in err
+    assert "__widget_django__" in err
+    assert "--allow-agent-mismatch" in err
+
+
+def test_allow_agent_mismatch_applies_the_dump(tmp_path):
+    dump = _write_dump_patch(tmp_path, "qwen", {"metadata": {"label": "q"}})
+    client = FakeClient(agents=[_agent("__widget_django__", {"name": "W"})])
+
+    rc = cli.main(
+        [
+            "--agent",
+            "__widget_django__",
+            "--patch",
+            str(dump),
+            "--yes",
+            "--allow-agent-mismatch",
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert client.calls_to("put_agent") == [("__widget_django__", {"name": "W", "label": "q"})]
+
+
+def test_patch_dump_for_the_same_agent_proceeds(tmp_path):
+    dump = _write_dump_patch(tmp_path, "qwen", {"metadata": {"label": "q"}})
+    client = FakeClient(agents=[_agent("qwen", {"name": "Q"})])
+
+    rc = cli.main(["--agent", "qwen", "--patch", str(dump), "--yes"], client_factory=lambda: client)
+
+    assert rc == 0
+    assert client.calls_to("put_agent") == [("qwen", {"name": "Q", "label": "q"})]
+
+
+def test_generic_patch_without_a_header_still_applies(tmp_path):
+    path = tmp_path / "generic.yml"
+    path.write_text("metadata:\n  label: q\n", encoding="utf-8")
+    client = FakeClient(agents=[_agent("other", {"name": "O"})])
+
+    rc = cli.main(["--agent", "other", "--patch", str(path), "--yes"], client_factory=lambda: client)
+
+    assert rc == 0
+    assert client.calls_to("put_agent") == [("other", {"name": "O", "label": "q"})]
+
+
+def test_all_with_a_dump_header_among_the_selected_agents_proceeds(tmp_path):
+    dump = _write_dump_patch(tmp_path, "qwen", {"metadata": {"label": "q"}})
+    client = FakeClient(agents=[_agent("qwen", {"name": "Q"}), _agent("other", {"name": "O"})])
+
+    rc = cli.main(["--all", "--patch", str(dump), "--yes"], client_factory=lambda: client)
+
+    assert rc == 0
+    assert client.calls_to("put_agent") == [
+        ("qwen", {"name": "Q", "label": "q"}),
+        ("other", {"name": "O", "label": "q"}),
+    ]
+
+
+def test_all_without_the_dump_header_agent_exits_2_without_writes(tmp_path, capsys):
+    dump = _write_dump_patch(tmp_path, "qwen", {"metadata": {"label": "q"}})
+    client = FakeClient(agents=[_agent("other", {"name": "O"})])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--all", "--patch", str(dump), "--yes"], client_factory=lambda: client)
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "qwen" in err
+    assert "other" in err
+    assert client.calls_to("put_agent") == []
+
+
+def test_all_with_an_internal_dump_header_exits_2_before_the_client(tmp_path, capsys):
+    dump = _write_dump_patch(tmp_path, "__widget_django__", {"metadata": {"label": "q"}})
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--all", "--patch", str(dump), "--yes"], client_factory=_forbidden_factory)
+
+    assert excinfo.value.code == 2
+    assert "__widget_django__" in capsys.readouterr().err
+
+
+def test_missing_patch_file_still_reports_the_existing_error(tmp_path, capsys):
+    missing = tmp_path / "missing.yml"
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(
+            ["--agent", "qwen", "--patch", str(missing), "--yes"],
+            client_factory=_forbidden_factory,
+        )
+
+    assert excinfo.value.code == 2
+    assert "cannot read --patch" in capsys.readouterr().err
 
 
 def test_malformed_set_exits_2_with_grammar(capsys):

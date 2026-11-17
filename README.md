@@ -134,6 +134,7 @@ GRINNING_CAT_API_SECURE_CONNECTION=false
 | `--restore PATH` | restore a YAML snapshot file or directory |
 | `--reload-dir DIR` | apply every dump file in `DIR` to its own agent, creating missing agents |
 | `--allow-system-wide` | allow system-wide categories such as embedder |
+| `--allow-agent-mismatch` | apply a per-agent dump to a different agent on purpose |
 | `--max-workers INT` | parallel workers, one task per agent (default: 1) |
 
 ### Patch syntax
@@ -262,6 +263,8 @@ To reload, apply the file with `--patch`, dry-run first:
 ```bash
 uv run python scripts/batch_agent_update.py --agent corso --patch ./dump/corso-1a2b3c4d.yml
 ```
+
+A dump file carries its `# agent-id:` header, and `--patch` refuses to apply it to a selection that does not contain that agent: `--agent altro --patch ./dump/corso-1a2b3c4d.yml` exits 2 before any client call, naming the file, the header agent and the selection. Pass `--allow-agent-mismatch` to apply a per-agent dump to a different agent on purpose. Generic patch files without the header are unaffected, and `--all` is accepted when the header agent is among the selected agents.
 
 Reloading a `system` dump that contains `embedder` or `ingestion` requires `--allow-system-wide`, because those settings re-embed every agent.
 

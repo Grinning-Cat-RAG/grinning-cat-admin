@@ -379,6 +379,33 @@ def _comment_syntax_hint(text: str) -> str:
     return ""
 
 
+_AGENT_ID_HEADER = re.compile(r"^#\s*agent-id:\s*(.+?)\s*$")
+
+
+def _patch_agent_id(path: str) -> str | None:
+    """Return the ``# agent-id:`` header of a dump file, or ``None``.
+
+    Only the leading comment block is inspected, so a ``# agent-id:`` comment
+    inside the YAML body is never mistaken for a dump header. A generic patch
+    file has no header and returns ``None``; an unreadable file also returns
+    ``None`` so ``load_patch`` keeps reporting the existing ``--patch`` error.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if not stripped.startswith("#"):
+                    break
+                match = _AGENT_ID_HEADER.match(stripped)
+                if match:
+                    return match.group(1)
+    except OSError:
+        return None
+    return None
+
+
 def load_patch(path: str) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, bool]]:
     """Load a YAML patch file into per-target patches and ``active_plugins``.
 
@@ -1661,6 +1688,9 @@ examples:
   uv run python scripts/batch_agent_update.py --dump ./dump --agent corso --dump-only llm
   #    Verify a dump against the live configuration; exit 0 means identical.
   uv run python scripts/batch_agent_update.py --dump ./dump --all --diff
+  #    A dump carries its '# agent-id:' header: --patch refuses to apply it to a
+  #    different agent. Override on purpose with --allow-agent-mismatch.
+  uv run python scripts/batch_agent_update.py --agent altro --patch ./dump/corso-1a2b3c4d.yml --allow-agent-mismatch
 
   # 8. Create an agent that does not exist yet, then configure it in the same run.
   #    --create-missing only applies to --agent substrings that match nothing; --all never creates.
@@ -1773,6 +1803,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="allow system-wide categories such as embedder",
     )
     parser.add_argument(
+        "--allow-agent-mismatch",
+        action="store_true",
+        help="apply a per-agent dump to a different agent on purpose",
+    )
+    parser.add_argument(
         "--max-workers",
         type=int,
         default=1,
@@ -1806,6 +1841,48 @@ def _build_parser() -> argparse.ArgumentParser:
         help="write only manifest.yml, without per-agent files (requires --dump)",
     )
     return parser
+
+
+def _check_patch_agent_header(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    selected_ids: list[str] | None = None,
+) -> None:
+    """Refuse a per-agent dump applied to a different agent selection.
+
+    A dump file carries ``# agent-id:`` in its header, but ``load_patch``
+    ignores comments, so without this guard ``--agent other --patch dump.yml``
+    would silently write one agent's configuration onto another. The check
+    runs before the client when ``--agent`` alone decides the selection, and
+    again after ``select_agents`` for ``--all``/``--exclude``. Pass
+    ``--allow-agent-mismatch`` to apply a dump to a different agent on purpose.
+    """
+    if not args.patch or args.allow_agent_mismatch:
+        return
+    header_id = _patch_agent_id(args.patch)
+    if header_id is None:
+        return
+    if selected_ids is not None:
+        if header_id in selected_ids:
+            return
+        selection = ", ".join(selected_ids) or "none"
+    elif args.all:
+        # --all never selects the system agent or a __* internal agent.
+        if header_id != "system" and not header_id.startswith("__"):
+            return
+        selection = "--all"
+    elif args.agent:
+        wanted = [substring.strip().lower() for substring in args.agent]
+        if any(substring in header_id.lower() for substring in wanted):
+            return
+        selection = ", ".join(args.agent)
+    else:
+        return
+    parser.error(
+        f"--patch {args.patch!r} was dumped from agent {header_id!r}, which is not "
+        f"among the selected agents ({selection}); pass --allow-agent-mismatch to "
+        "apply it anyway"
+    )
 
 
 def _validate(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -1899,6 +1976,7 @@ def _validate(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None
         )
     if not args.agent and not args.all:
         parser.error("--agent or --all is required")
+    _check_patch_agent_header(parser, args)
 
 
 def _run_dump(
@@ -2336,6 +2414,7 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
         except SelectionError as exc:
             print(str(exc), file=sys.stderr)
             return 2
+        _check_patch_agent_header(parser, args, [agent.agent_id for agent in selected])
         plan_ops = [_operation_label(operation) for operation in built_operations or []]
         plan_metadata_keys = sorted(
             key

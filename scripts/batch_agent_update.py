@@ -37,6 +37,18 @@ from grinning_cat_python_sdk.models.api.admins import AgentOutput  # noqa: E402
 OPERATION_FLAGS = ("llm", "plugin", "metadata", "name", "set", "patch")
 
 
+class _PlainSafeDumper(yaml.SafeDumper):
+    """Safe dumper that never emits anchors/aliases for repeated objects.
+
+    The machine output reuses the same list objects across agents, which
+    ``yaml.safe_dump`` would render as ``&id001``/``*id001``. The output is
+    consumed by humans and scripts, so plain YAML is the better contract.
+    """
+
+    def ignore_aliases(self, data: Any) -> bool:
+        return True
+
+
 class SelectionError(ValueError):
     """The requested agent selection cannot be satisfied."""
 
@@ -881,8 +893,9 @@ def _dump_header(
 
 def _render_dump_yaml(payload: dict[str, Any], header: str) -> str:
     """Prepend the metadata header to the YAML body of one dump file."""
-    body = yaml.safe_dump(
+    body = yaml.dump(
         payload,
+        Dumper=_PlainSafeDumper,
         sort_keys=False,
         default_flow_style=False,
         allow_unicode=True,
@@ -946,8 +959,9 @@ def _write_dump_manifest(
     }
     _atomic_write_text(
         directory / "manifest.yml",
-        yaml.safe_dump(
+        yaml.dump(
             manifest,
+            Dumper=_PlainSafeDumper,
             sort_keys=False,
             default_flow_style=False,
             allow_unicode=True,
@@ -1051,8 +1065,9 @@ def _read_dump_file(path: Path) -> tuple[str | None, str]:
 
 def _normalize_payload(payload: Any) -> str:
     """Canonical YAML for a payload, so key order never shows up as a diff."""
-    return yaml.safe_dump(
+    return yaml.dump(
         payload,
+        Dumper=_PlainSafeDumper,
         sort_keys=True,
         default_flow_style=False,
         allow_unicode=True,
@@ -1439,7 +1454,16 @@ def _restore_operations(snapshot: dict[str, Any]) -> list[Operation]:
 
 def _report(envelope: dict[str, Any], as_yaml: bool) -> None:
     if as_yaml:
-        print(yaml.safe_dump(envelope, sort_keys=False, default_flow_style=False, allow_unicode=True), end="")
+        print(
+            yaml.dump(
+                envelope,
+                Dumper=_PlainSafeDumper,
+                sort_keys=False,
+                default_flow_style=False,
+                allow_unicode=True,
+            ),
+            end="",
+        )
         return
 
     for result in envelope["agents"]:
@@ -1469,7 +1493,16 @@ def _exit_code(envelope: dict[str, Any]) -> int:
 
 def _report_dump(envelope: dict[str, Any], as_yaml: bool) -> None:
     if as_yaml:
-        print(yaml.safe_dump(envelope, sort_keys=False, default_flow_style=False, allow_unicode=True), end="")
+        print(
+            yaml.dump(
+                envelope,
+                Dumper=_PlainSafeDumper,
+                sort_keys=False,
+                default_flow_style=False,
+                allow_unicode=True,
+            ),
+            end="",
+        )
         return
     for entry in envelope["agents"]:
         result = "ok" if entry["ok"] else "failed"
@@ -1488,7 +1521,16 @@ def _dump_exit_code(envelope: dict[str, Any]) -> int:
 
 def _report_diff(envelope: dict[str, Any], as_yaml: bool) -> None:
     if as_yaml:
-        print(yaml.safe_dump(envelope, sort_keys=False, default_flow_style=False, allow_unicode=True), end="")
+        print(
+            yaml.dump(
+                envelope,
+                Dumper=_PlainSafeDumper,
+                sort_keys=False,
+                default_flow_style=False,
+                allow_unicode=True,
+            ),
+            end="",
+        )
         return
     for entry in envelope["agents"]:
         result = "identical" if entry["identical"] else "different"
@@ -1916,7 +1958,7 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
     if not args.yes:
         if args.yaml:
             print(
-                yaml.safe_dump(
+                yaml.dump(
                     {
                         "dry_run": True,
                         "agents": [
@@ -1929,6 +1971,7 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
                         ],
                         "system_wide": [{"op": _operation_label(operation)} for operation in system_wide],
                     },
+                    Dumper=_PlainSafeDumper,
                     sort_keys=False,
                     default_flow_style=False,
                     allow_unicode=True,

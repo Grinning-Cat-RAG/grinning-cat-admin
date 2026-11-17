@@ -514,6 +514,23 @@ def test_dry_run_yaml_plan(capsys):
     }
 
 
+def test_dry_run_yaml_plan_has_no_anchors(capsys):
+    client = FakeClient(agents=[_agent("corso1"), _agent("corso2")])
+
+    rc = cli.main(["--agent", "corso", "--llm", "gpt-4={}", "--yaml"], client_factory=lambda: client)
+
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "&id" not in out
+    assert "*id" not in out
+    payload = yaml.safe_load(out)
+    assert payload["dry_run"] is True
+    assert [entry["agent"] for entry in payload["agents"]] == ["corso1", "corso2"]
+    assert payload["agents"][0]["ops"] == ["llm:gpt-4"]
+    assert payload["agents"][1]["ops"] == ["llm:gpt-4"]
+    assert payload["system_wide"] == []
+
+
 def test_discovery_failure_exits_1(capsys):
     client = FakeClient(agents=[], fail_on={"get_agents"})
 

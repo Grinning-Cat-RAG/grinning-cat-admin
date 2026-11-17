@@ -205,12 +205,12 @@ def _parse_value(raw: str) -> Any:
 
 
 def parse_llm(items: list[str]) -> list[tuple[str, dict[str, Any]]]:
-    """Parse ``MODEL=JSON`` items; the JSON side must be an object."""
+    """Parse ``NAME=JSON`` items; the JSON side must be an object."""
     parsed = []
     for item in items:
         model, separator, raw = item.partition("=")
         if not separator or not model:
-            raise ValueError(f"invalid --llm {item!r}: expected MODEL=JSON")
+            raise ValueError(f"invalid --llm {item!r}: expected NAME=JSON")
         try:
             patch = json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -869,15 +869,25 @@ def _exit_code(envelope: dict[str, Any]) -> int:
 
 
 _EXAMPLES = """\
+LLM configuration names: --llm and --set llm:<name> take the configuration name
+reported by GET /llm/settings (the JSON-schema title, i.e. the class name such as
+LLMOpenRouterConfig). The friendly label shown in ADMIN is humanReadableName and
+is NOT accepted. An unknown name fails with "X not supported. Must be one of
+[...]", which lists every valid name.
+
 examples:
   # 1. Select an LLM configuration and set its model. The OpenRouter configuration used from
   #    ADMIN takes its model parameters from openrouter.ai, so model must be a valid
   #    OpenRouter model id; run the dry-run first and read the plan before adding --yes.
-  uv run python scripts/batch_agent_update.py --agent corso --set llm:openrouter:model=anthropic/claude-3.5-sonnet
+  uv run python scripts/batch_agent_update.py --agent corso \\
+    --set llm:LLMOpenRouterConfig:model=anthropic/claude-3.5-sonnet
+  #    The same change through --llm, which merges an object into the configuration:
+  uv run python scripts/batch_agent_update.py --agent corso \\
+    --llm LLMOpenRouterConfig='{"model": "anthropic/claude-3.5-sonnet"}'
 
   # 2. Set api_key of an LLM configuration; any other key (temperature, base_url, ...) works the same way.
   #    Prefer --set (or an env var, or a patch file you do not commit); never commit a real key.
-  uv run python scripts/batch_agent_update.py --agent corso --set llm:openrouter:api_key=sk-...
+  uv run python scripts/batch_agent_update.py --agent corso --set llm:LLMOpenRouterConfig:api_key=sk-...
   uv run python scripts/batch_agent_update.py --agent corso --patch examples/patch-llm-openrouter.yml
 
   # 3. Add or overwrite an agent metadata key; --name is the shortcut for --metadata name=VALUE.
@@ -944,8 +954,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--llm",
         action="append",
-        metavar="MODEL=JSON",
-        help="merge a JSON object into the LLM settings of MODEL (repeatable)",
+        metavar="NAME=JSON",
+        help="merge a JSON object into the LLM configuration NAME from GET /llm/settings (repeatable)",
     )
     parser.add_argument(
         "--plugin",

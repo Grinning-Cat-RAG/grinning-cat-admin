@@ -121,7 +121,7 @@ GRINNING_CAT_API_SECURE_CONNECTION=false
 | `--agent SUBSTRING` | agent id or a case-insensitive substring of it (repeatable) |
 | `--all` | every agent except system and `__*` |
 | `--exclude SUBSTRING` | drop agents whose id contains this substring, case-insensitive (repeatable) |
-| `--llm MODEL=JSON` | merge a JSON object into the LLM settings of MODEL (repeatable) |
+| `--llm NAME=JSON` | merge a JSON object into the LLM configuration NAME from `GET /llm/settings` (repeatable) |
 | `--plugin NAME=on\|off` | enable or disable a plugin (repeatable) |
 | `--metadata KEY=VALUE` | merge one metadata key (repeatable) |
 | `--name VALUE` | shortcut for `--metadata name=VALUE` |
@@ -136,14 +136,18 @@ GRINNING_CAT_API_SECURE_CONNECTION=false
 
 ### Patch syntax
 
-`--set CATEGORY:NAME:KEY=VALUE` patches one factory setting. `CATEGORY` is one of `llm`, `chunking`, `vector_database`, `auth_handler`, `agentic_workflow`, `context_retriever`, `file_manager`, `plugins`, `metadata`, `embedder` or `ingestion`. `NAME` is the setting name (the model for `llm`, the plugin id for `plugins`). `KEY` may be dotted (`a.b.c`) to reach nested values. Values are decoded as numbers, booleans, null or collections when possible, otherwise kept as strings.
+`--set CATEGORY:NAME:KEY=VALUE` patches one factory setting. `CATEGORY` is one of `llm`, `chunking`, `vector_database`, `auth_handler`, `agentic_workflow`, `context_retriever`, `file_manager`, `plugins`, `metadata`, `embedder` or `ingestion`. `NAME` is the setting name (for `llm` the configuration name from `GET /llm/settings`, for `plugins` the plugin id). `KEY` may be dotted (`a.b.c`) to reach nested values. Values are decoded as numbers, booleans, null or collections when possible, otherwise kept as strings.
+
+#### LLM configuration names
+
+The accepted `--llm` / `--set llm:<name>` value is the **configuration name reported by `GET /llm/settings`** — the JSON-schema `title`, i.e. the class name such as `LLMOpenRouterConfig`, `LLMOpenAIChatConfig` or `LLMDefaultConfig`. The friendly label shown in ADMIN (e.g. "OpenAI ChatGPT") is `humanReadableName` and is **not** accepted. If you pass an unknown name, the API error lists all valid ones (`X not supported. Must be one of [...]`); that list is the authoritative source.
 
 `--patch FILE` takes a **YAML** file (`.yml` or `.yaml`) keyed by category, then by name. Any other suffix is rejected before the file is read. JSONC `//` comments are no longer accepted; migrate them to `#` once:
 
 ```yaml
 # one category per top-level key, then one entry per setting name
 llm:
-  gpt-4:
+  LLMOpenAIChatConfig:
     temperature: 0.2
 plugins:
   foo:
@@ -188,7 +192,7 @@ Dry run against every agent whose id contains `prod`:
 ```bash
 uv run python scripts/batch_agent_update.py \
   --agent prod \
-  --set llm:gpt-4:temperature=0.2
+  --set llm:LLMOpenAIChatConfig:temperature=0.2
 ```
 
 Apply a plugin toggle and a metadata label to every non-system agent, keeping a snapshot in `./backup`:
@@ -210,11 +214,11 @@ Two ready-to-use YAML files ship in `examples/`; copy one, adapt the names and v
 - Scalars are not implicitly typed: `on` stays the string `on`, `0123` stays `"0123"`, `2024-01-01` stays a string; `1.10` becomes the number `1.1`.
 - One document per file: no `---` separators. Anchors and aliases are allowed.
 - `active_plugins` maps a plugin name to `on`/`off` and reconciles like `--plugin`.
-- Never commit a real key: prefer `--set llm:<cfg>:api_key=...`, an environment variable, or a patch file you do not commit.
+- Never commit a real key: prefer `--set llm:<name>:api_key=...`, an environment variable, or a patch file you do not commit.
 
 | File | What it shows |
 | --- | --- |
-| [`examples/patch-llm-openrouter.yml`](examples/patch-llm-openrouter.yml) | a single LLM change on the OpenRouter configuration used from ADMIN (`model` must be a valid OpenRouter id) |
+| [`examples/patch-llm-openrouter.yml`](examples/patch-llm-openrouter.yml) | a single LLM change on the `LLMOpenRouterConfig` configuration used from ADMIN (`model` must be a valid OpenRouter id) |
 | [`examples/patch-full-agent.yml`](examples/patch-full-agent.yml) | the "everything" shape: metadata, LLM, chunker, plugin settings and the active plugin set |
 
 ```bash

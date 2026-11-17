@@ -19,10 +19,12 @@ metadata:
   owner: didattica
 
 # LLM configuration: select the OpenRouter configuration and override two
-# parameters. openrouter.ai supplies the model parameters, so `model` must be a
-# valid OpenRouter model id.
+# parameters. The name is the configuration name reported by GET /llm/settings
+# (the JSON-schema title, i.e. the class name LLMOpenRouterConfig), not the
+# friendly label shown in ADMIN. openrouter.ai supplies the model parameters,
+# so `model` must be a valid OpenRouter model id.
 llm:
-  openrouter:
+  LLMOpenRouterConfig:
     model: anthropic/claude-3.5-sonnet
     temperature: 0.2
     max_tokens: 1024

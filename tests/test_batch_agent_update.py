@@ -1662,11 +1662,11 @@ def test_yaml_quoted_hash_inside_a_value_is_preserved(tmp_path):
     # YAML starts a comment at a '#' preceded by whitespace, so a value that
     # contains '#' must be quoted; the shipped examples always quote it.
     patch_file = tmp_path / "patch.yml"
-    patch_file.write_text('llm:\n  openrouter:\n    api_key: "sk-abc#def"\n', encoding="utf-8")
+    patch_file.write_text('llm:\n  LLMOpenRouterConfig:\n    api_key: "sk-abc#def"\n', encoding="utf-8")
 
     patches, active_plugins = cli.load_patch(str(patch_file))
 
-    assert patches[("llm", "openrouter")] == {"api_key": "sk-abc#def"}
+    assert patches[("llm", "LLMOpenRouterConfig")] == {"api_key": "sk-abc#def"}
     assert active_plugins == {}
 
 
@@ -1836,8 +1836,8 @@ EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
 def test_shipped_llm_example_loads_through_load_patch():
     patches, active_plugins = cli.load_patch(str(EXAMPLES_DIR / "patch-llm-openrouter.yml"))
 
-    assert set(patches) == {("llm", "openrouter")}
-    assert patches[("llm", "openrouter")] == {
+    assert set(patches) == {("llm", "LLMOpenRouterConfig")}
+    assert patches[("llm", "LLMOpenRouterConfig")] == {
         "model": "anthropic/claude-3.5-sonnet",
         "api_key": "sk-or-REPLACE-ME",
         "temperature": 0.2,
@@ -1850,13 +1850,13 @@ def test_shipped_full_agent_example_loads_through_load_patch():
 
     assert set(patches) == {
         ("metadata", ""),
-        ("llm", "openrouter"),
+        ("llm", "LLMOpenRouterConfig"),
         ("chunking", "default"),
         ("plugins", "my_plugin"),
         ("plugins", "other_plugin"),
     }
     assert patches[("metadata", "")] == {"name": "Corso 1", "label": "production", "owner": "didattica"}
-    assert patches[("llm", "openrouter")] == {
+    assert patches[("llm", "LLMOpenRouterConfig")] == {
         "model": "anthropic/claude-3.5-sonnet",
         "temperature": 0.2,
         "max_tokens": 1024,
@@ -1884,7 +1884,7 @@ def test_shipped_full_agent_example_produces_the_expected_operations(capsys):
         "metadata",
         "plugin:my_plugin",
         "plugin:other_plugin",
-        "settings:llm:openrouter",
+        "settings:llm:LLMOpenRouterConfig",
         "settings:chunking:default",
         "settings:plugins:my_plugin",
         "settings:plugins:other_plugin",
@@ -1893,11 +1893,42 @@ def test_shipped_full_agent_example_produces_the_expected_operations(capsys):
     assert client.calls == [("get_agents", ())]
 
 
+def test_examples_use_real_schema_titles():
+    for name in ("patch-llm-openrouter.yml", "patch-full-agent.yml"):
+        text = (EXAMPLES_DIR / name).read_text(encoding="utf-8")
+        assert "LLMOpenRouterConfig" in text
+        assert not any(line.strip() == "openrouter:" for line in text.splitlines())
+
+
+def test_help_uses_real_llm_config_names(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--help"], client_factory=_forbidden_factory)
+
+    assert excinfo.value.code == 0
+    out = capsys.readouterr().out
+    assert "llm:LLMOpenRouterConfig:model=" in out
+    legacy_name = "llm:" + "openrouter:"
+    assert legacy_name not in out
+
+
+def test_help_and_readme_explain_where_llm_names_come_from(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--help"], client_factory=_forbidden_factory)
+
+    assert excinfo.value.code == 0
+    help_text = capsys.readouterr().out
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    for text in (help_text, readme):
+        assert "GET /llm/settings" in text
+        assert "humanReadableName" in text
+        assert "not supported. Must be one of" in text
+
+
 def test_yaml_anchors_and_aliases_are_allowed(tmp_path):
     patch_file = tmp_path / "patch.yml"
     patch_file.write_text(
         "llm:\n"
-        "  openrouter: &base\n"
+        "  LLMOpenRouterConfig: &base\n"
         "    temperature: 0.2\n"
         "  mirror: *base\n",
         encoding="utf-8",
@@ -1905,7 +1936,7 @@ def test_yaml_anchors_and_aliases_are_allowed(tmp_path):
 
     patches, _active_plugins = cli.load_patch(str(patch_file))
 
-    assert patches[("llm", "openrouter")] == {"temperature": 0.2}
+    assert patches[("llm", "LLMOpenRouterConfig")] == {"temperature": 0.2}
     assert patches[("llm", "mirror")] == {"temperature": 0.2}
 
 

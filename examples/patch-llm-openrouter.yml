@@ -4,6 +4,12 @@
 # keys you list change: the script reads the current settings, merges this patch
 # and writes the result back, so model parameters you do not mention survive.
 #
+# The setting name is the configuration name reported by GET /llm/settings (the
+# JSON-schema title, i.e. the Python class name: LLMOpenRouterConfig). The
+# friendly label shown in ADMIN ("OpenRouter") is humanReadableName and is NOT
+# accepted here; an unknown name fails with "X not supported. Must be one of
+# [...]", which lists every valid name.
+#
 # 1. Dry-run first: without --yes the script prints the plan and exits 2.
 #      uv run python scripts/batch_agent_update.py \
 #        --agent corso --patch examples/patch-llm-openrouter.yml
@@ -12,11 +18,11 @@
 # openrouter.ai supplies the model parameters, so `model` must be a valid
 # OpenRouter model id (the same string you would paste in the ADMIN UI).
 llm:
-  openrouter:
+  LLMOpenRouterConfig:
     model: anthropic/claude-3.5-sonnet
-    # Never commit a real key: prefer --set llm:openrouter:api_key=... on the
-    # command line, an environment variable, or a patch file you do not commit.
-    # The placeholder below is quoted on purpose: quote any value containing
-    # '#', otherwise YAML treats the rest of the line as a comment.
+    # Never commit a real key: prefer --set llm:LLMOpenRouterConfig:api_key=...
+    # on the command line, an environment variable, or a patch file you do not
+    # commit. The placeholder below is quoted on purpose: quote any value
+    # containing '#', otherwise YAML treats the rest of the line as a comment.
     api_key: "sk-or-REPLACE-ME"
     temperature: 0.2

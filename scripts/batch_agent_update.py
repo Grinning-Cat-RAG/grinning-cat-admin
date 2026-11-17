@@ -10,8 +10,12 @@ operation failed, 2 = dry-run, abort or usage error.
 
 import argparse
 import json
+import re
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -150,13 +154,19 @@ FACTORY_CATEGORIES = {
 
 
 def merge_factory_setting(
-    client: Any, category: str, name: str, patch: dict[str, Any], agent_id: str
+    client: Any,
+    category: str,
+    name: str,
+    patch: dict[str, Any],
+    agent_id: str,
+    current: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Read-merge-write one factory setting and return the merged value.
 
     The core PUT replaces the whole value dict, so the current value must be
     read first and merged with the patch: a blind PUT would drop every key the
-    patch does not mention.
+    patch does not mention. ``current`` lets the caller supply a value it has
+    already read (the batch runner reads every state once, before any write).
     """
     try:
         attribute, getter_name, putter_name = FACTORY_CATEGORIES[category]
@@ -165,8 +175,10 @@ def merge_factory_setting(
         raise ValueError(f"unknown factory category {category!r}; valid categories: {valid}") from None
 
     endpoint = getattr(client, attribute)
-    current = getattr(endpoint, getter_name)(name, agent_id)
-    merged = {**current.value, **patch}
+    base: dict[str, Any] = (
+        getattr(endpoint, getter_name)(name, agent_id).value if current is None else current
+    )
+    merged = {**base, **patch}
     getattr(endpoint, putter_name)(name, agent_id, merged)
     return merged
 
@@ -306,17 +318,28 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return merged
 
 
-def _validate_categories(patches: dict[tuple[str, str], dict[str, Any]]) -> None:
+def _validate_categories(
+    patches: dict[tuple[str, str], dict[str, Any]], allow_system_wide: bool
+) -> None:
     for category, _name in patches:
         if category in SYSTEM_WIDE_CATEGORIES:
-            raise ValueError(f"{category} is system-wide; --allow-system-wide is not implemented yet")
+            if not allow_system_wide:
+                raise ValueError(
+                    f"{category} is system-wide: it re-embeds every agent; "
+                    "pass --allow-system-wide to apply it"
+                )
+            continue
         if category not in VALID_CATEGORIES:
             valid = ", ".join(sorted(VALID_CATEGORIES))
             raise ValueError(f"unknown category {category!r}; valid categories: {valid}")
 
 
-def _build_operations(args: argparse.Namespace) -> list[Operation]:
-    """Parse every operation before the first write, so a typo aborts the run."""
+def _build_operations(args: argparse.Namespace) -> tuple[list[Operation], list[Operation]]:
+    """Parse every operation before the first write, so a typo aborts the run.
+
+    Returns ``(per_agent, system_wide)``: system-wide categories are applied
+    once for the whole deployment, never once per selected agent.
+    """
     patches = load_patch(args.patch) if args.patch else {}
     for key, patch in parse_set(args.set or []).items():
         patches[key] = _deep_merge(patches.get(key, {}), patch)
@@ -329,9 +352,10 @@ def _build_operations(args: argparse.Namespace) -> list[Operation]:
     if args.name is not None:
         metadata_payload["name"] = args.name
 
-    _validate_categories(patches)
+    _validate_categories(patches, args.allow_system_wide)
 
     operations = []
+    system_wide = []
     if metadata_payload:
         operations.append(Operation(kind="metadata", name="", payload=metadata_payload))
     for model, patch in parse_llm(args.llm or []):
@@ -341,36 +365,54 @@ def _build_operations(args: argparse.Namespace) -> list[Operation]:
     for (category, name), patch in patches.items():
         if category == "metadata":
             continue
+        if category in SYSTEM_WIDE_CATEGORIES:
+            system_wide.append(Operation(kind="system", category=category, name=name, payload=patch))
+            continue
         operations.append(Operation(kind="settings", category=category, name=name, payload=patch))
-    return operations
+    return operations, system_wide
 
 
-def update_metadata(client: Any, agent: AgentOutput, updates: dict[str, Any]) -> dict[str, Any]:
+def update_metadata(
+    client: Any,
+    agent: AgentOutput,
+    updates: dict[str, Any],
+    current: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Merge ``updates`` into the agent metadata and PUT the whole dict.
 
     The core replaces the metadata dict, so the merge is mandatory: a blind
-    PUT would drop every key the update does not mention.
+    PUT would drop every key the update does not mention. ``current`` lets the
+    caller supply a value it has already read.
     """
-    merged = {**agent.metadata, **updates}
+    base = dict(agent.metadata) if current is None else current
+    merged = {**base, **updates}
     result = client.utils.put_agent(agent.agent_id, merged)
     if not result.updated:
         raise RuntimeError(f"updated=false for {agent.agent_id}")
     return merged
 
 
-def reconcile_plugin(client: Any, agent_id: str, name: str, desired: bool) -> str:
+def reconcile_plugin(
+    client: Any,
+    agent_id: str,
+    name: str,
+    desired: bool,
+    active: bool | None = None,
+) -> str:
     """Bring one plugin to ``desired`` state, tolerating the core's flip toggle.
 
     The core endpoint flips the active flag instead of setting it, so the
     current state is read first and the result is verified afterwards: a
-    repeated command must never toggle twice.
+    repeated command must never toggle twice. ``active`` lets the caller
+    supply a state it has already read.
     """
-    collection = client.plugins.get_available_plugins(agent_id)
-    item = next((plugin for plugin in collection.installed if plugin.id == name), None)
-    if item is None:
-        raise RuntimeError(f"plugin {name!r} is not installed for agent {agent_id!r}")
+    if active is None:
+        collection = client.plugins.get_available_plugins(agent_id)
+        item = next((plugin for plugin in collection.installed if plugin.id == name), None)
+        if item is None:
+            raise RuntimeError(f"plugin {name!r} is not installed for agent {agent_id!r}")
+        active = bool(item.local_info.get("active", False))
 
-    active = bool(item.local_info.get("active", False))
     if active == desired:
         return "already-on" if desired else "already-off"
 
@@ -389,53 +431,344 @@ def reconcile_plugin(client: Any, agent_id: str, name: str, desired: bool) -> st
 def _operation_label(operation: Operation) -> str:
     if operation.kind == "settings":
         return f"settings:{operation.category}:{operation.name}"
+    if operation.kind == "system":
+        return f"system:{operation.category}:{operation.name}"
     if operation.kind in ("llm", "plugin"):
         return f"{operation.kind}:{operation.name}"
     return operation.kind
 
 
-def _apply_operation(client: Any, agent: AgentOutput, operation: Operation) -> str:
+def _apply_operation(client: Any, agent: AgentOutput, operation: Operation, current: Any) -> str:
     if operation.kind == "metadata":
-        update_metadata(client, agent, operation.payload)
+        update_metadata(client, agent, operation.payload, current=current)
         return "updated"
     if operation.kind == "llm":
-        merge_factory_setting(client, "llm", operation.name, operation.payload, agent.agent_id)
+        merge_factory_setting(
+            client, "llm", operation.name, operation.payload, agent.agent_id, current=current
+        )
         return "merged"
     if operation.kind == "plugin":
-        return reconcile_plugin(client, agent.agent_id, operation.name, operation.payload)
+        return reconcile_plugin(client, agent.agent_id, operation.name, operation.payload, active=current)
     if operation.kind == "settings":
         if operation.category == "plugins":
             client.plugins.put_plugin_settings(operation.name, agent.agent_id, operation.payload)
             return "merged"
-        merge_factory_setting(client, operation.category, operation.name, operation.payload, agent.agent_id)
+        merge_factory_setting(
+            client, operation.category, operation.name, operation.payload, agent.agent_id, current=current
+        )
         return "merged"
     raise NotImplementedError(f"operation {operation.kind!r} is not implemented yet")
 
 
+def _apply_system_wide(client: Any, operation: Operation) -> str:
+    """Read-merge-write one system-scoped factory setting (embedder/ingestion)."""
+    if operation.category == "embedder":
+        current = client.embedder.get_embedder_settings(operation.name).value
+        client.embedder.put_embedder_settings(operation.name, {**current, **operation.payload})
+        return "merged"
+    if operation.category == "ingestion":
+        current = client.ingestion.get_ingestion_settings(operation.name).value
+        client.ingestion.put_ingestion_settings(operation.name, {**current, **operation.payload})
+        return "merged"
+    raise NotImplementedError(f"system-wide category {operation.category!r} is not implemented yet")
+
+
+_READ_FAILED = object()
+
+
+def _plugin_active(client: Any, agent_id: str, name: str) -> bool:
+    collection = client.plugins.get_available_plugins(agent_id)
+    item = next((plugin for plugin in collection.installed if plugin.id == name), None)
+    return bool(item.local_info.get("active", False)) if item is not None else False
+
+
+def _read_operation_state(client: Any, agent: AgentOutput, operation: Operation) -> Any:
+    """Read the current value of one operation, before any write of the run."""
+    if operation.kind == "metadata":
+        return dict(agent.metadata)
+    if operation.kind == "llm":
+        return dict(
+            client.large_language_model.get_large_language_model_settings(
+                operation.name, agent.agent_id
+            ).value
+        )
+    if operation.kind == "plugin":
+        collection = client.plugins.get_available_plugins(agent.agent_id)
+        item = next((plugin for plugin in collection.installed if plugin.id == operation.name), None)
+        if item is None:
+            raise RuntimeError(
+                f"plugin {operation.name!r} is not installed for agent {agent.agent_id!r}"
+            )
+        return bool(item.local_info.get("active", False))
+    if operation.kind == "settings":
+        if operation.category == "plugins":
+            return dict(client.plugins.get_plugin_settings(operation.name, agent.agent_id).value)
+        attribute, getter_name, _putter_name = FACTORY_CATEGORIES[operation.category]
+        endpoint = getattr(client, attribute)
+        return dict(getattr(endpoint, getter_name)(operation.name, agent.agent_id).value)
+    raise NotImplementedError(f"operation {operation.kind!r} is not implemented yet")
+
+
+def _build_snapshot(
+    agent: AgentOutput,
+    operations: list[Operation],
+    states: list[Any],
+    client: Any,
+) -> dict[str, Any]:
+    """Collect the pre-write state of everything this run touches for one agent."""
+    snapshot: dict[str, Any] = {
+        "agent_id": agent.agent_id,
+        "metadata": dict(agent.metadata),
+        "llm": {},
+        "plugins": {},
+        "categories": {},
+    }
+    for operation, state in zip(operations, states):
+        if state is _READ_FAILED:
+            continue
+        if operation.kind == "llm":
+            snapshot["llm"][operation.name] = dict(state)
+        elif operation.kind == "plugin":
+            settings = client.plugins.get_plugin_settings(operation.name, agent.agent_id).value
+            snapshot["plugins"][operation.name] = {"active": bool(state), "settings": dict(settings)}
+        elif operation.kind == "settings":
+            if operation.category == "plugins":
+                snapshot["plugins"][operation.name] = {
+                    "active": _plugin_active(client, agent.agent_id, operation.name),
+                    "settings": dict(state),
+                }
+            else:
+                snapshot["categories"].setdefault(operation.category, {})[operation.name] = dict(state)
+    return snapshot
+
+
+_SNAPSHOT_LOCK = threading.Lock()
+
+
+def _write_snapshot(directory: Path, snapshot: dict[str, Any], argv: list[str]) -> None:
+    """Write one agent snapshot and update the shared manifest atomically enough."""
+    directory.mkdir(parents=True, exist_ok=True)
+    agent_id = snapshot["agent_id"]
+    filename = re.sub(r"[^A-Za-z0-9_.-]", "_", agent_id) + ".json"
+    (directory / filename).write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+
+    with _SNAPSHOT_LOCK:
+        manifest_path = directory / "manifest.json"
+        manifest: dict[str, Any]
+        if manifest_path.exists():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        else:
+            manifest = {"created_at": _utc_now(), "argv": list(argv), "agents": []}
+        if agent_id not in manifest["agents"]:
+            manifest["agents"].append(agent_id)
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
+def _run_agent(
+    client: Any,
+    agent: AgentOutput,
+    ordered: list[Operation],
+    snapshot_dir: Path | None,
+    argv: list[str],
+) -> dict[str, Any]:
+    """Read every state, snapshot, then write: one agent never aborts the run."""
+    result: dict[str, Any] = {"agent_id": agent.agent_id, "ok": True, "ops": [], "error": None}
+    try:
+        states: list[Any] = []
+        for operation in ordered:
+            try:
+                states.append(_read_operation_state(client, agent, operation))
+            except Exception as exc:  # noqa: BLE001 - one operation must not abort the agent
+                states.append(_READ_FAILED)
+                result["ops"].append(
+                    {"op": _operation_label(operation), "status": "failed", "detail": str(exc)}
+                )
+                result["ok"] = False
+
+        if snapshot_dir is not None:
+            try:
+                snapshot = _build_snapshot(agent, ordered, states, client)
+                _write_snapshot(snapshot_dir, snapshot, argv)
+            except Exception as exc:  # noqa: BLE001 - a failed snapshot must block every write
+                result["ok"] = False
+                result["error"] = f"snapshot failed: {exc}"
+                return result
+
+        for operation, current in zip(ordered, states):
+            if current is _READ_FAILED:
+                continue
+            try:
+                detail = _apply_operation(client, agent, operation, current)
+            except Exception as exc:  # noqa: BLE001 - one operation must not abort the agent
+                result["ops"].append(
+                    {"op": _operation_label(operation), "status": "failed", "detail": str(exc)}
+                )
+                result["ok"] = False
+            else:
+                result["ops"].append({"op": _operation_label(operation), "status": "ok", "detail": detail})
+    except Exception as exc:  # noqa: BLE001 - one agent must not abort the run
+        result["ok"] = False
+        result["error"] = str(exc)
+    return result
+
+
 def execute_batch(
-    client: Any, selected: list[AgentOutput], operations: list[Operation]
-) -> list[dict[str, Any]]:
-    """Apply every operation to every agent, isolating failures per agent and per op."""
-    ordered = sorted(operations, key=lambda operation: _OPERATION_ORDER[operation.kind])
-    results = []
-    for agent in selected:
-        result: dict[str, Any] = {"agent_id": agent.agent_id, "ok": True, "ops": [], "error": None}
+    client: Any,
+    selected: list[AgentOutput],
+    operations: list[Operation] | dict[str, list[Operation]],
+    system_wide: list[Operation] | None = None,
+    snapshot_dir: Path | None = None,
+    argv: list[str] | None = None,
+    max_workers: int = 1,
+    missing: set[str] | None = None,
+) -> dict[str, Any]:
+    """Apply every operation, isolating failures per agent and per operation.
+
+    ``operations`` is either one list applied to every agent or a per-agent
+    mapping (used by ``--restore``). System-wide operations run exactly once,
+    after the per-agent loop.
+    """
+    argv = list(argv or [])
+    if isinstance(operations, dict):
+        per_agent = operations
+
+        def ordered_for(agent: AgentOutput) -> list[Operation]:
+            return sorted(per_agent.get(agent.agent_id, []), key=lambda op: _OPERATION_ORDER[op.kind])
+
+    else:
+        ordered = sorted(operations, key=lambda operation: _OPERATION_ORDER[operation.kind])
+
+        def ordered_for(agent: AgentOutput) -> list[Operation]:
+            return ordered
+
+    def run(agent: AgentOutput) -> dict[str, Any]:
+        if missing and agent.agent_id in missing:
+            return {
+                "agent_id": agent.agent_id,
+                "ok": False,
+                "ops": [],
+                "error": "agent not found on the server",
+            }
+        return _run_agent(client, agent, ordered_for(agent), snapshot_dir, argv)
+
+    if max_workers > 1:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = list(executor.map(run, selected))
+    else:
+        results = [run(agent) for agent in selected]
+
+    system_results = []
+    for operation in system_wide or []:
         try:
-            for operation in ordered:
-                try:
-                    detail = _apply_operation(client, agent, operation)
-                except Exception as exc:  # noqa: BLE001 - one operation must not abort the agent
-                    result["ops"].append(
-                        {"op": _operation_label(operation), "status": "failed", "detail": str(exc)}
-                    )
-                    result["ok"] = False
-                else:
-                    result["ops"].append({"op": _operation_label(operation), "status": "ok", "detail": detail})
-        except Exception as exc:  # noqa: BLE001 - one agent must not abort the run
-            result["ok"] = False
-            result["error"] = str(exc)
-        results.append(result)
-    return results
+            detail = _apply_system_wide(client, operation)
+        except Exception as exc:  # noqa: BLE001 - one system-wide op must not abort the run
+            system_results.append(
+                {"op": _operation_label(operation), "status": "failed", "detail": str(exc)}
+            )
+        else:
+            system_results.append({"op": _operation_label(operation), "status": "ok", "detail": detail})
+
+    ok = sum(1 for result in results if result["ok"])
+    skipped = sum(
+        1
+        for result in results
+        if result["ok"]
+        and result["ops"]
+        and all(operation["detail"].startswith("already-") for operation in result["ops"])
+    )
+    return {
+        "agents": results,
+        "system_wide": system_results,
+        "summary": {
+            "selected": len(selected),
+            "ok": ok,
+            "failed": len(results) - ok,
+            "skipped": skipped,
+        },
+    }
+
+
+def _utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _default_backup_dir() -> Path:
+    return Path(f"agent-backup-{_utc_stamp()}")
+
+
+def _load_snapshots(path: str) -> list[dict[str, Any]]:
+    """Load every snapshot in a file or directory, skipping the manifest."""
+    target = Path(path)
+    if target.is_dir():
+        files = sorted(item for item in target.glob("*.json") if item.name != "manifest.json")
+    else:
+        files = [target]
+
+    snapshots = []
+    for file in files:
+        try:
+            data = json.loads(file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"cannot read snapshot {str(file)!r}: {exc}") from None
+        if not isinstance(data, dict) or "agent_id" not in data:
+            raise ValueError(f"invalid snapshot {str(file)!r}: missing agent_id")
+        snapshots.append(data)
+    if not snapshots:
+        raise ValueError(f"no snapshots found in {path!r}")
+    return snapshots
+
+
+def _restore_operations(snapshot: dict[str, Any]) -> list[Operation]:
+    """Turn one snapshot back into the operations that recreate it."""
+    operations = [Operation(kind="metadata", name="", payload=dict(snapshot.get("metadata", {})))]
+    for model, value in snapshot.get("llm", {}).items():
+        operations.append(Operation(kind="llm", name=model, payload=dict(value)))
+    for name, entry in snapshot.get("plugins", {}).items():
+        operations.append(
+            Operation(
+                kind="settings",
+                category="plugins",
+                name=name,
+                payload=dict(entry.get("settings", {})),
+            )
+        )
+        operations.append(Operation(kind="plugin", name=name, payload=bool(entry.get("active", False))))
+    for category, entries in snapshot.get("categories", {}).items():
+        for name, value in entries.items():
+            operations.append(Operation(kind="settings", category=category, name=name, payload=dict(value)))
+    return operations
+
+
+def _report(envelope: dict[str, Any], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(envelope, indent=2))
+        return
+
+    for result in envelope["agents"]:
+        for operation in result["ops"]:
+            line = f"[batch] agent={result['agent_id']} op={operation['op']} result={operation['status']}"
+            if operation["status"] == "failed":
+                line += f" reason={operation['detail']}"
+            print(line)
+        if result["error"]:
+            print(f"[batch] agent={result['agent_id']} error={result['error']}", file=sys.stderr)
+    for operation in envelope["system_wide"]:
+        line = f"[batch] system-wide op={operation['op']} result={operation['status']}"
+        if operation["status"] == "failed":
+            line += f" reason={operation['detail']}"
+        print(line)
+
+
+def _exit_code(envelope: dict[str, Any]) -> int:
+    if any(not result["ok"] for result in envelope["agents"]):
+        return 1
+    if any(operation["status"] != "ok" for operation in envelope["system_wide"]):
+        return 1
+    return 0
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -524,7 +857,7 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         metavar="INT",
-        help="parallel workers (default: 1)",
+        help="parallel workers, one task per agent (default: 1)",
     )
     return parser
 
@@ -557,17 +890,22 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
 
     _validate(parser, args)
 
-    if args.max_workers != 1:
-        parser.error("--max-workers > 1 is not implemented yet")
+    if args.max_workers < 1:
+        parser.error("--max-workers must be at least 1")
 
+    snapshots = None
+    system_wide: list[Operation] = []
     if args.restore:
-        print("--restore is not implemented yet", file=sys.stderr)
-        return 2
-
-    try:
-        operations = _build_operations(args)
-    except ValueError as exc:
-        parser.error(str(exc))
+        try:
+            snapshots = _load_snapshots(args.restore)
+        except ValueError as exc:
+            parser.error(str(exc))
+        operations: list[Operation] | dict[str, list[Operation]] = {}
+    else:
+        try:
+            operations, system_wide = _build_operations(args)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     client = client_factory()
     if client is None:
@@ -579,14 +917,31 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
         print(f"cannot list agents: {exc}", file=sys.stderr)
         return 1
 
-    try:
-        selected = select_agents(agents, args.agent or [], args.all, args.exclude or [])
-    except SelectionError as exc:
-        print(str(exc), file=sys.stderr)
-        return 2
-
-    ops = _operations(args)
-    metadata_keys = _metadata_keys(args)
+    missing: set[str] | None = None
+    if snapshots is not None:
+        by_id = {agent.agent_id: agent for agent in agents}
+        selected = []
+        per_agent: dict[str, list[Operation]] = {}
+        missing = set()
+        for snapshot in snapshots:
+            agent_id = snapshot["agent_id"]
+            per_agent[agent_id] = _restore_operations(snapshot)
+            if agent_id not in by_id:
+                missing.add(agent_id)
+            selected.append(
+                AgentOutput(agent_id=agent_id, metadata=dict(snapshot.get("metadata", {})))
+            )
+        operations = per_agent
+        ops = ["restore"]
+        metadata_keys: list[str] = []
+    else:
+        try:
+            selected = select_agents(agents, args.agent or [], args.all, args.exclude or [])
+        except SelectionError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        ops = _operations(args)
+        metadata_keys = _metadata_keys(args)
 
     if not args.yes:
         if args.json:
@@ -599,24 +954,24 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
         else:
             for line in render_plan(selected, ops, metadata_keys):
                 print(line)
+            print(f"system-wide: {len(system_wide)}")
         print("dry-run: no changes written (pass --yes to apply)", file=sys.stderr)
         return 2
 
-    results = execute_batch(client, selected, operations)
+    backup_dir = Path(args.backup_out) if args.backup_out else _default_backup_dir()
 
-    if args.json:
-        print(json.dumps(results, indent=2))
-    else:
-        for result in results:
-            for operation in result["ops"]:
-                line = f"[batch] agent={result['agent_id']} op={operation['op']} result={operation['status']}"
-                if operation["status"] == "failed":
-                    line += f" reason={operation['detail']}"
-                print(line)
-            if result["error"]:
-                print(f"[batch] agent={result['agent_id']} error={result['error']}", file=sys.stderr)
-
-    return 0 if all(result["ok"] for result in results) else 1
+    envelope = execute_batch(
+        client,
+        selected,
+        operations,
+        system_wide=system_wide,
+        snapshot_dir=backup_dir,
+        argv=list(argv) if argv is not None else sys.argv[1:],
+        max_workers=args.max_workers,
+        missing=missing,
+    )
+    _report(envelope, args.json)
+    return _exit_code(envelope)
 
 
 if __name__ == "__main__":

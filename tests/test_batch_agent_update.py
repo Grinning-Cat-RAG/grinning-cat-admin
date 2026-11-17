@@ -6,6 +6,7 @@ fake client: no test opens a socket, touches Redis or needs a running Cat.
 import importlib.util
 import json
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,12 @@ if _spec is None or _spec.loader is None:  # pragma: no cover - import failure
 cli = importlib.util.module_from_spec(_spec)
 sys.modules["batch_agent_update"] = cli
 _spec.loader.exec_module(cli)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_backup_dir(monkeypatch, tmp_path):
+    """Never let a test write an ``agent-backup-*`` directory into the repo."""
+    monkeypatch.setattr(cli, "_default_backup_dir", lambda: tmp_path / "agent-backup")
 
 
 def _forbidden_factory():
@@ -144,6 +151,8 @@ class FakeClient:
         updated_false=None,
         plugins=None,
         toggle_noop=False,
+        plugin_settings=None,
+        concurrency_guard=False,
     ):
         self.calls = []
         self.agents = list(agents or [])
@@ -151,8 +160,14 @@ class FakeClient:
         self.fail_on = set(fail_on or ())
         self.updated_false = set(updated_false or ())
         self.plugin_states = {agent_id: dict(items) for agent_id, items in (plugins or {}).items()}
-        self.plugin_settings = {}
+        self.plugin_settings = {
+            (agent_id, plugin_id): dict(values)
+            for (agent_id, plugin_id), values in (plugin_settings or {}).items()
+        }
         self.toggle_noop = toggle_noop
+        self.concurrency_guard = concurrency_guard
+        self._agent_locks = {}
+        self._agent_ids = {agent.agent_id for agent in self.agents}
         for attribute in (
             "utils",
             "large_language_model",
@@ -164,10 +179,25 @@ class FakeClient:
             "context_retriever",
             "file_manager",
             "embedder",
+            "ingestion",
         ):
             setattr(self, attribute, FakeEndpoint(self, attribute))
 
     def _handle(self, attribute, method_name, args, kwargs):
+        if not self.concurrency_guard:
+            return self._dispatch(attribute, method_name, args, kwargs)
+        agent_id = next((value for value in args if isinstance(value, str) and value in self._agent_ids), None)
+        if agent_id is None:
+            return self._dispatch(attribute, method_name, args, kwargs)
+        lock = self._agent_locks.setdefault(agent_id, threading.Lock())
+        if not lock.acquire(blocking=False):
+            raise RuntimeError(f"concurrent access to agent {agent_id!r}")
+        try:
+            return self._dispatch(attribute, method_name, args, kwargs)
+        finally:
+            lock.release()
+
+    def _dispatch(self, attribute, method_name, args, kwargs):
         self.calls.append((method_name, args))
         if method_name in self.fail_on:
             raise RuntimeError(f"{method_name} failed")
@@ -192,12 +222,21 @@ class FakeClient:
             if not self.toggle_noop:
                 state[plugin_id] = not state[plugin_id]
             return PluginToggleOutput(info="toggled")
+        if method_name == "get_plugin_settings":
+            plugin_id, agent_id = args
+            return FactoryObjectSettingOutput(
+                name=plugin_id, value=dict(self.plugin_settings.get((agent_id, plugin_id), {}))
+            )
         if method_name == "put_plugin_settings":
             plugin_id, agent_id, values = args
             key = (agent_id, plugin_id)
             merged = {**self.plugin_settings.get(key, {}), **values}
             self.plugin_settings[key] = merged
             return PluginSettingsOutput(name=plugin_id, value=merged)
+        if method_name in ("put_embedder_settings", "put_ingestion_settings"):
+            name, values = args
+            self.settings[(attribute, name)] = dict(values)
+            return FactoryObjectSettingOutput(name=name, value=dict(values))
         if method_name.startswith("get_"):
             name = args[0]
             return FactoryObjectSettingOutput(name=name, value=dict(self.settings.get((attribute, name), {})))
@@ -757,12 +796,12 @@ def test_embedder_is_rejected_as_system_wide(capsys):
     assert client.calls == []
 
 
-def test_max_workers_above_one_exits_2(capsys):
+def test_max_workers_zero_exits_2(capsys):
     client = FakeClient(agents=[_agent("corso1")])
 
     with pytest.raises(SystemExit) as excinfo:
         cli.main(
-            ["--agent", "corso", "--metadata", "a=b", "--max-workers", "2", "--yes"],
+            ["--agent", "corso", "--metadata", "a=b", "--max-workers", "0", "--yes"],
             client_factory=lambda: client,
         )
 
@@ -781,11 +820,11 @@ def test_yes_happy_path_json_report(capsys):
 
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
-    assert isinstance(payload, list)
-    assert payload[0]["agent_id"] == "corso1"
-    assert payload[0]["ok"] is True
-    assert payload[0]["ops"] == [{"op": "metadata", "status": "ok", "detail": "updated"}]
-    assert payload[0]["error"] is None
+    assert payload["summary"]["ok"] == 1
+    assert payload["agents"][0]["agent_id"] == "corso1"
+    assert payload["agents"][0]["ok"] is True
+    assert payload["agents"][0]["ops"] == [{"op": "metadata", "status": "ok", "detail": "updated"}]
+    assert payload["agents"][0]["error"] is None
 
 
 def test_human_mode_prints_one_line_per_op(capsys):
@@ -835,3 +874,223 @@ def test_operation_order_is_metadata_llm_plugins_settings():
     assert rc == 0
     write_calls = [name for name, _args in client.calls if name.startswith("put_")]
     assert write_calls == ["put_agent", "put_large_language_model_settings", "put_chunker_settings"]
+
+
+def test_system_wide_without_flag_exits_2_and_writes_nothing(capsys):
+    client = FakeClient(agents=[_agent("corso1"), _agent("corso2"), _agent("corso3")])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(
+            ["--agent", "corso", "--set", "embedder:openai:key=x", "--yes"],
+            client_factory=lambda: client,
+        )
+
+    assert excinfo.value.code == 2
+    assert "system-wide" in capsys.readouterr().err
+    assert client.calls == []
+
+
+def test_system_wide_with_flag_runs_once_for_all_agents(capsys):
+    client = FakeClient(
+        agents=[_agent("corso1"), _agent("corso2"), _agent("corso3")],
+        settings={("embedder", "openai"): {"model": "text-embedding-3-small"}},
+    )
+
+    rc = cli.main(
+        [
+            "--agent",
+            "corso",
+            "--set",
+            "embedder:openai:key=x",
+            "--allow-system-wide",
+            "--yes",
+            "--json",
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert client.calls_to("put_embedder_settings") == [
+        ("openai", {"model": "text-embedding-3-small", "key": "x"})
+    ]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["summary"]["ok"] == 3
+    assert payload["system_wide"] == [{"op": "system:embedder:openai", "status": "ok", "detail": "merged"}]
+
+
+def test_system_wide_failure_exits_1_without_touching_agents(capsys):
+    client = FakeClient(
+        agents=[_agent("corso1"), _agent("corso2")],
+        fail_on={"put_embedder_settings"},
+    )
+
+    rc = cli.main(
+        [
+            "--agent",
+            "corso",
+            "--set",
+            "embedder:openai:key=x",
+            "--allow-system-wide",
+            "--yes",
+            "--json",
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["summary"] == {"selected": 2, "ok": 2, "failed": 0, "skipped": 0}
+    assert payload["system_wide"][0]["status"] == "failed"
+
+
+def test_dry_run_prints_the_system_wide_count(capsys):
+    client = FakeClient(agents=[_agent("corso1")])
+
+    rc = cli.main(
+        ["--agent", "corso", "--set", "embedder:openai:key=x", "--allow-system-wide"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 2
+    assert "system-wide: 1" in capsys.readouterr().out
+
+
+def test_dry_run_json_stays_an_array_with_system_wide(capsys):
+    client = FakeClient(agents=[_agent("corso1")])
+
+    rc = cli.main(
+        ["--agent", "corso", "--set", "embedder:openai:key=x", "--allow-system-wide", "--json"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert isinstance(payload, list)
+    assert payload == [{"agent": "corso1", "ops": ["set"], "metadata_keys": []}]
+
+
+def test_backup_out_writes_one_snapshot_per_agent_and_a_manifest(tmp_path):
+    client = FakeClient(agents=[_agent("corso1", {"public": True}), _agent("corso2")])
+
+    rc = cli.main(
+        ["--agent", "corso", "--metadata", "label=b", "--yes", "--backup-out", str(tmp_path)],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert sorted(path.name for path in tmp_path.glob("*.json")) == [
+        "corso1.json",
+        "corso2.json",
+        "manifest.json",
+    ]
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["agents"] == ["corso1", "corso2"]
+    assert manifest["argv"]
+    assert manifest["created_at"]
+    snapshot = json.loads((tmp_path / "corso1.json").read_text(encoding="utf-8"))
+    assert snapshot["metadata"] == {"public": True}
+
+
+def test_snapshot_round_trip_restores_the_original_metadata(tmp_path):
+    client = FakeClient(agents=[_agent("corso1", {"public": True, "label": "a"})])
+
+    first = cli.main(
+        ["--agent", "corso", "--name", "X", "--yes", "--backup-out", str(tmp_path)],
+        client_factory=lambda: client,
+    )
+    assert first == 0
+    assert client.calls_to("put_agent") == [("corso1", {"public": True, "label": "a", "name": "X"})]
+
+    client.calls.clear()
+    second = cli.main(["--restore", str(tmp_path), "--yes"], client_factory=lambda: client)
+    assert second == 0
+    assert client.calls_to("put_agent") == [("corso1", {"public": True, "label": "a"})]
+
+    client.calls.clear()
+    third = cli.main(["--restore", str(tmp_path), "--yes"], client_factory=lambda: client)
+    assert third == 0
+    assert client.calls_to("put_agent") == [("corso1", {"public": True, "label": "a"})]
+
+
+def test_unwritable_backup_dir_blocks_every_write():
+    client = FakeClient(agents=[_agent("corso1"), _agent("corso2")])
+
+    rc = cli.main(
+        ["--agent", "corso", "--metadata", "label=b", "--yes", "--backup-out", "/proc/nope"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 1
+    assert [name for name, _args in client.calls if name.startswith("put_")] == []
+
+
+def test_restore_dry_run_exits_2_without_writes(tmp_path):
+    client = FakeClient(agents=[_agent("corso1", {"public": True})])
+    cli.main(
+        ["--agent", "corso", "--name", "X", "--yes", "--backup-out", str(tmp_path)],
+        client_factory=lambda: client,
+    )
+    client.calls.clear()
+
+    rc = cli.main(["--restore", str(tmp_path)], client_factory=lambda: client)
+
+    assert rc == 2
+    assert [name for name, _args in client.calls if name.startswith("put_")] == []
+
+
+def test_max_workers_matches_sequential_results(capsys):
+    agents = [_agent("corso1"), _agent("corso2"), _agent("corso3")]
+    sequential = FakeClient(agents=agents)
+    parallel = FakeClient(agents=agents, concurrency_guard=True)
+
+    rc1 = cli.main(
+        ["--agent", "corso", "--metadata", "label=b", "--yes", "--json", "--max-workers", "1"],
+        client_factory=lambda: sequential,
+    )
+    first = json.loads(capsys.readouterr().out)
+    rc4 = cli.main(
+        ["--agent", "corso", "--metadata", "label=b", "--yes", "--json", "--max-workers", "4"],
+        client_factory=lambda: parallel,
+    )
+    second = json.loads(capsys.readouterr().out)
+
+    assert (rc1, rc4) == (0, 0)
+    assert first == second
+
+
+def test_mixed_run_summary_counts_skipped_and_failed(capsys):
+    client = FakeClient(
+        agents=[_agent("corso1"), _agent("corso2"), _agent("corso3")],
+        plugins={"corso1": {"foo": True}, "corso2": {"foo": False}, "corso3": {}},
+    )
+
+    rc = cli.main(["--agent", "corso", "--plugin", "foo=on", "--yes", "--json"], client_factory=lambda: client)
+
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["summary"] == {"selected": 3, "ok": 2, "failed": 1, "skipped": 1}
+
+
+def test_ingestion_system_wide_merges_once(capsys):
+    client = FakeClient(
+        agents=[_agent("corso1"), _agent("corso2")],
+        settings={("ingestion", "default"): {"engine": "core"}},
+    )
+
+    rc = cli.main(
+        [
+            "--agent",
+            "corso",
+            "--set",
+            "ingestion:default:batch_size=8",
+            "--allow-system-wide",
+            "--yes",
+            "--json",
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert client.calls_to("put_ingestion_settings") == [("default", {"engine": "core", "batch_size": 8})]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["system_wide"] == [{"op": "system:ingestion:default", "status": "ok", "detail": "merged"}]

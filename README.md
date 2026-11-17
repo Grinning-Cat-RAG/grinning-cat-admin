@@ -126,7 +126,7 @@ GRINNING_CAT_API_SECURE_CONNECTION=false
 | `--metadata KEY=VALUE` | merge one metadata key (repeatable) |
 | `--name VALUE` | shortcut for `--metadata name=VALUE` |
 | `--set CATEGORY:NAME:KEY=VALUE` | patch one factory setting (repeatable) |
-| `--patch FILE` | YAML (or plain JSON) file with per-category patches and `active_plugins` |
+| `--patch FILE` | YAML file (`.yml` or `.yaml`) with per-category patches and `active_plugins` |
 | `--yes` | apply the changes (default: dry-run) |
 | `--json` | print the plan as JSON |
 | `--backup-out DIR` | directory for the before-snapshot |
@@ -136,9 +136,9 @@ GRINNING_CAT_API_SECURE_CONNECTION=false
 
 ### Patch syntax
 
-`--set CATEGORY:NAME:KEY=VALUE` patches one factory setting. `CATEGORY` is one of `llm`, `chunking`, `vector_database`, `auth_handler`, `agentic_workflow`, `context_retriever`, `file_manager`, `plugins`, `metadata`, `embedder` or `ingestion`. `NAME` is the setting name (the model for `llm`, the plugin id for `plugins`). `KEY` may be dotted (`a.b.c`) to reach nested values. Values are decoded as JSON when possible, otherwise kept as strings.
+`--set CATEGORY:NAME:KEY=VALUE` patches one factory setting. `CATEGORY` is one of `llm`, `chunking`, `vector_database`, `auth_handler`, `agentic_workflow`, `context_retriever`, `file_manager`, `plugins`, `metadata`, `embedder` or `ingestion`. `NAME` is the setting name (the model for `llm`, the plugin id for `plugins`). `KEY` may be dotted (`a.b.c`) to reach nested values. Values are decoded as numbers, booleans, null or collections when possible, otherwise kept as strings.
 
-`--patch FILE` takes a **YAML** object keyed by category, then by name. Plain JSON is valid YAML, so existing JSON patch files keep working; JSONC `//` comments are **not** accepted any more (migrate them to `#` once):
+`--patch FILE` takes a **YAML** file (`.yml` or `.yaml`) keyed by category, then by name. Any other suffix is rejected before the file is read. JSONC `//` comments are no longer accepted; migrate them to `#` once:
 
 ```yaml
 # one category per top-level key, then one entry per setting name
@@ -155,12 +155,7 @@ active_plugins:
   bar: off
 ```
 
-Two YAML gotchas:
-
-1. **Quote values containing `#`**, otherwise the rest of the line is a comment: `api_key: "sk-abc#def"`.
-2. **Comments start with `#`**. JSONC `//` comments are no longer accepted, so migrate them once.
-
-The file must contain exactly one YAML document (no `---` separators); YAML anchors and aliases are allowed. Scalars are read without YAML implicit typing, then decoded as JSON when possible: `label: on` stays the string `on`, `date: 2024-01-01` stays a string, and `1.10` becomes the number `1.1`.
+The file must contain exactly one YAML document (no `---` separators); YAML anchors and aliases are allowed. Scalars are read without YAML implicit typing, then a leaf is converted only when it is a valid number, boolean or null literal: `label: on` stays the string `on`, `date: 2024-01-01` stays a string, and `1.10` becomes the number `1.1`.
 
 `active_plugins` is the one top-level key that is **not** a category: it maps a plugin name to `on` or `off` (`true`/`false`/`1`/`0` work too, case-insensitive) and produces the same operation as `--plugin`, so it reconciles the current state and never toggles twice. Anything else is a usage error. When the same plugin is named both in the file and on the command line, the explicit `--plugin NAME=on|off` **wins** over the file value.
 
@@ -193,7 +188,7 @@ Dry run against every agent whose id contains `prod`:
 ```bash
 uv run python scripts/batch_agent_update.py \
   --agent prod \
-  --llm gpt-4='{"temperature":0.2}'
+  --set llm:gpt-4:temperature=0.2
 ```
 
 Apply a plugin toggle and a metadata label to every non-system agent, keeping a snapshot in `./backup`:
@@ -209,7 +204,12 @@ uv run python scripts/batch_agent_update.py \
 
 #### Patch file examples
 
-Two ready-to-use YAML files ship in `examples/`; copy one, adapt the names and values, and run it. Comments start with `#`, and a value containing `#` must be quoted.
+Two ready-to-use YAML files ship in `examples/`; copy one, adapt the names and values, and run it. A patch file is a small YAML tutorial in itself:
+
+- `#` starts a comment. Quote any value containing `#` (`api_key: "sk-abc#def"`), otherwise the rest of the line is a comment.
+- Scalars are not implicitly typed: `on` stays the string `on`, `0123` stays `"0123"`, `2024-01-01` stays a string; `1.10` becomes the number `1.1`.
+- One document per file: no `---` separators. Anchors and aliases are allowed.
+- `active_plugins` maps a plugin name to `on`/`off` and reconciles like `--plugin`.
 
 | File | What it shows |
 | --- | --- |

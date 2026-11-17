@@ -1,19 +1,31 @@
-# The "everything" example: copy it, delete the sections you do not need.
-# Every section below goes through the same read-merge-write path as the
-# equivalent --set/--llm/--plugin flag. Comments start with '#'.
+# The "everything" example: copy this file, delete the sections you do not need,
+# then run the dry-run first (no --yes) and read the plan before writing.
+#
+# A patch file is a YAML mapping of category -> setting name -> values. Only the
+# keys you list change: the script reads the current settings, merges this patch
+# and writes the result back, so everything you omit survives.
+#
+#   uv run python scripts/batch_agent_update.py \
+#     --agent corso --patch examples/patch-full-agent.yml
+#
+# Add --yes only when the plan looks right.
 
-# Agent metadata: merged into the existing metadata dict.
+# Agent metadata: merged into the existing dict, so keys you omit survive.
+# Metadata keys are literal: `owner.team: didattica` would create the key
+# "owner.team", not a nested {"owner": {"team": ...}} map. Keep metadata flat.
 metadata:
   name: Corso 1
   label: production
   owner: didattica
 
-# LLM configuration. openrouter.ai provides the model parameters, so model
-# must be a valid OpenRouter model id.
+# LLM configuration: select the OpenRouter configuration and override two
+# parameters. openrouter.ai supplies the model parameters, so `model` must be a
+# valid OpenRouter model id.
 llm:
   openrouter:
     model: anthropic/claude-3.5-sonnet
     temperature: 0.2
+    max_tokens: 1024
 
 # Chunker configuration: only the keys you pass change, siblings are preserved.
 chunking:
@@ -29,7 +41,12 @@ plugins:
       enabled: true
       threshold: 0.7
   other_plugin:
-    api_key: REPLACE-ME
+    api_key: "REPLACE-ME"
+    # A dotted key is literal in a patch file: this writes the key
+    # "http.timeout" with a nested {"seconds": 30} value, not
+    # {"http": {"timeout": {"seconds": 30}}}. Use --set for real nesting.
+    http.timeout:
+      seconds: 30
 
 # Active plugin set: on enables, off disables (true/false/1/0 work too).
 # Reconciled like --plugin, so a repeated run never toggles twice. An explicit

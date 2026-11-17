@@ -871,10 +871,9 @@ def _exit_code(envelope: dict[str, Any]) -> int:
 _EXAMPLES = """\
 examples:
   # 1. Select an LLM configuration and set its model. The OpenRouter configuration used from
-  #    ADMIN pulls its model parameters from openrouter.ai, so model must be a valid
+  #    ADMIN takes its model parameters from openrouter.ai, so model must be a valid
   #    OpenRouter model id; run the dry-run first and read the plan before adding --yes.
   uv run python scripts/batch_agent_update.py --agent corso --set llm:openrouter:model=anthropic/claude-3.5-sonnet
-  uv run python scripts/batch_agent_update.py --agent corso --llm openrouter='{"model": "anthropic/claude-3.5-sonnet"}'
 
   # 2. Set api_key of an LLM configuration; any other key (temperature, base_url, ...) works the same way.
   uv run python scripts/batch_agent_update.py --agent corso --set llm:openrouter:api_key=sk-...
@@ -895,11 +894,8 @@ examples:
   uv run python scripts/batch_agent_update.py --agent corso --set plugins:my_plugin:options.enabled=true
 
   # 6. Everything else.
-  #    A patch file is YAML (recommended) or plain JSON and carries the full shape:
-  #    metadata, llm, chunking, plugins, active_plugins.
-  #    Comments start with '#'; quote a value that contains '#', e.g. api_key: "sk-abc#def".
-  #    JSONC '//' comments are no longer accepted: migrate them to '#' once.
-  #    Copy and adapt:
+  #    A patch file is YAML: one document, '#' comments, and a value containing '#' must be
+  #    quoted, e.g. api_key: "sk-abc#def". Copy and adapt:
   #      examples/patch-llm-openrouter.yml  one LLM change on OpenRouter
   #      examples/patch-full-agent.yml      metadata + all settings + active_plugins
   #    active_plugins takes on/off (true/false/1/0 also work) and reconciles like

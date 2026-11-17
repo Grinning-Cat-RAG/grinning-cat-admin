@@ -1,12 +1,23 @@
-# One LLM change: the OpenRouter configuration used from ADMIN.
-# Copy this file, adapt it, then run:
-#   uv run python scripts/batch_agent_update.py --agent corso --patch examples/patch-llm-openrouter.yml
-# Add --yes only after the dry-run plan looks right.
+# Patch one LLM configuration: the OpenRouter one used from ADMIN.
+#
+# A patch file is a YAML mapping of category -> setting name -> values. Only the
+# keys you list change: the script reads the current settings, merges this patch
+# and writes the result back, so model parameters you do not mention survive.
+#
+# 1. Dry-run first: without --yes the script prints the plan and exits 2.
+#      uv run python scripts/batch_agent_update.py \
+#        --agent corso --patch examples/patch-llm-openrouter.yml
+# 2. Read the plan, then add --yes to write.
+#
+# openrouter.ai supplies the model parameters, so `model` must be a valid
+# OpenRouter model id (the same string you would paste in the ADMIN UI).
 llm:
   openrouter:
-    # openrouter.ai provides the model parameters, so model must be a valid OpenRouter id.
     model: anthropic/claude-3.5-sonnet
-    # Prefer passing a real secret with --set llm:openrouter:api_key=... instead.
-    # Quote values containing '#': api_key: "sk-abc#def"
+    # A real secret is better passed on the command line, where it never lands
+    # in a file you might commit:
+    #   --set llm:openrouter:api_key=sk-or-...
+    # The placeholder below is quoted on purpose: quote any value containing
+    # '#', otherwise YAML treats the rest of the line as a comment.
     api_key: "sk-or-REPLACE-ME"
     temperature: 0.2

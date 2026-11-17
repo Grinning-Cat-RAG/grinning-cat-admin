@@ -90,6 +90,32 @@ def test_help_includes_examples(capsys):
     assert len(invocations) >= 10
 
 
+def test_help_examples_are_yaml_only(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--help"], client_factory=_forbidden_factory)
+
+    assert excinfo.value.code == 0
+    out = capsys.readouterr().out
+    examples = out.split("examples:", 1)[1]
+    assert "examples/patch-llm-openrouter.yml" in examples
+    assert "examples/patch-full-agent.yml" in examples
+    assert "json" not in examples.lower()
+    assert "jsonc" not in examples.lower()
+    assert all(len(line) <= 120 for line in examples.splitlines())
+
+
+def test_readme_documents_yaml_examples_only():
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+
+    assert "examples/patch-llm-openrouter.yml" in readme
+    assert "examples/patch-full-agent.yml" in readme
+    assert "plain json" not in readme.lower()
+    legacy_lines = [line for line in readme.splitlines() if "jsonc" in line.lower()]
+    assert len(legacy_lines) <= 1
+    for line in legacy_lines:
+        assert "no longer accepted" in line.lower()
+
+
 def test_usage_error_does_not_build_the_client(capsys):
     with pytest.raises(SystemExit) as excinfo:
         cli.main(["--agent", "x"], client_factory=_forbidden_factory)
@@ -1772,8 +1798,11 @@ def test_shipped_llm_example_loads_through_load_patch():
     patches, active_plugins = cli.load_patch(str(EXAMPLES_DIR / "patch-llm-openrouter.yml"))
 
     assert set(patches) == {("llm", "openrouter")}
-    assert patches[("llm", "openrouter")]["model"] == "anthropic/claude-3.5-sonnet"
-    assert patches[("llm", "openrouter")]["temperature"] == 0.2
+    assert patches[("llm", "openrouter")] == {
+        "model": "anthropic/claude-3.5-sonnet",
+        "api_key": "sk-or-REPLACE-ME",
+        "temperature": 0.2,
+    }
     assert active_plugins == {}
 
 
@@ -1788,7 +1817,17 @@ def test_shipped_full_agent_example_loads_through_load_patch():
         ("plugins", "other_plugin"),
     }
     assert patches[("metadata", "")] == {"name": "Corso 1", "label": "production", "owner": "didattica"}
+    assert patches[("llm", "openrouter")] == {
+        "model": "anthropic/claude-3.5-sonnet",
+        "temperature": 0.2,
+        "max_tokens": 1024,
+    }
     assert patches[("chunking", "default")] == {"chunk_size": 512, "chunk_overlap": 32}
+    assert patches[("plugins", "my_plugin")] == {"options": {"enabled": True, "threshold": 0.7}}
+    assert patches[("plugins", "other_plugin")] == {
+        "api_key": "REPLACE-ME",
+        "http.timeout": {"seconds": 30},
+    }
     assert active_plugins == {"my_plugin": True, "other_plugin": False}
 
 

@@ -5,7 +5,6 @@ fake client: no test opens a socket, touches Redis or needs a running Cat.
 """
 import hashlib
 import importlib.util
-import json
 import sys
 import threading
 from argparse import Namespace
@@ -144,7 +143,7 @@ def test_agent_or_all_is_required(capsys):
 
 def test_restore_is_exclusive_with_operations(capsys):
     with pytest.raises(SystemExit) as excinfo:
-        cli.main(["--restore", "snap.json", "--llm", "gpt-4={}"], client_factory=_forbidden_factory)
+        cli.main(["--restore", "snap.yml", "--llm", "gpt-4={}"], client_factory=_forbidden_factory)
 
     assert excinfo.value.code == 2
     assert "--restore" in capsys.readouterr().err
@@ -411,8 +410,8 @@ def _snapshot_files(directory):
     """Every snapshot file in ``directory``, excluding the manifest and dotfiles."""
     return sorted(
         path
-        for path in Path(directory).glob("*.json")
-        if path.name != "manifest.json" and not path.name.startswith(".")
+        for path in Path(directory).glob("*.yml")
+        if path.name != "manifest.yml" and not path.name.startswith(".")
     )
 
 
@@ -1253,14 +1252,57 @@ def test_backup_out_writes_one_snapshot_per_agent_and_a_manifest(tmp_path):
     assert rc == 0
     snapshot_files = _snapshot_files(tmp_path)
     assert len(snapshot_files) == 2
-    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    manifest = yaml.safe_load((tmp_path / "manifest.yml").read_text(encoding="utf-8"))
     assert manifest["agents"] == ["corso1", "corso2"]
     assert manifest["argv"]
     assert manifest["created_at"]
-    snapshots = [json.loads(path.read_text(encoding="utf-8")) for path in snapshot_files]
+    snapshots = [yaml.safe_load(path.read_text(encoding="utf-8")) for path in snapshot_files]
     by_id = {snapshot["agent_id"]: snapshot for snapshot in snapshots}
     assert by_id["corso1"]["metadata"] == {"public": True}
     assert by_id["corso2"]["metadata"] == {}
+
+
+def test_backup_snapshots_and_manifest_are_yaml_0600_and_restore_reads_them(tmp_path):
+    client = FakeClient(agents=[_agent("corso1", {"public": True})])
+
+    rc = cli.main(
+        ["--agent", "corso", "--metadata", "label=b", "--yes", "--backup-out", str(tmp_path)],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    snapshot_files = _snapshot_files(tmp_path)
+    assert [path.suffix for path in snapshot_files] == [".yml"]
+    manifest_path = tmp_path / "manifest.yml"
+    assert manifest_path.is_file()
+    assert not (tmp_path / "manifest.json").exists()
+    for path in [*snapshot_files, manifest_path]:
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert isinstance(yaml.safe_load(path.read_text(encoding="utf-8")), dict)
+
+    client.calls.clear()
+    restored = cli.main(["--restore", str(tmp_path), "--yes"], client_factory=lambda: client)
+
+    assert restored == 0
+    assert client.calls_to("put_agent") == [("corso1", {"public": True})]
+
+
+def test_restore_accepts_a_single_yaml_file_with_any_extension(tmp_path):
+    client = FakeClient(agents=[_agent("corso1", {"public": True})])
+    snapshot = {
+        "agent_id": "corso1",
+        "metadata": {"public": True},
+        "llm": {},
+        "plugins": {},
+        "categories": {},
+    }
+    snapshot_file = tmp_path / "snapshot.txt"
+    snapshot_file.write_text(yaml.safe_dump(snapshot), encoding="utf-8")
+
+    rc = cli.main(["--restore", str(snapshot_file), "--yes"], client_factory=lambda: client)
+
+    assert rc == 0
+    assert client.calls_to("put_agent") == [("corso1", {"public": True})]
 
 
 def test_snapshot_round_trip_restores_the_original_metadata(tmp_path):
@@ -1501,7 +1543,7 @@ def test_snapshot_contains_metadata_llm_plugins_and_categories(tmp_path):
     assert rc == 0
     files = _snapshot_files(tmp_path)
     assert len(files) == 1
-    snapshot = json.loads(files[0].read_text(encoding="utf-8"))
+    snapshot = yaml.safe_load(files[0].read_text(encoding="utf-8"))
     assert snapshot["metadata"] == {"public": True}
     assert snapshot["llm"] == {"gpt-4": {"model": "gpt-4", "temperature": 0.0}}
     assert snapshot["plugins"] == {"foo": {"active": True, "settings": {"k": "v"}}}
@@ -1640,15 +1682,15 @@ def test_snapshot_filenames_do_not_collide(tmp_path):
     files = _snapshot_files(tmp_path)
     expected = sorted(
         [
-            f"a_b-{hashlib.sha1(b'a/b').hexdigest()[:8]}.json",
-            f"a_b-{hashlib.sha1(b'a_b').hexdigest()[:8]}.json",
+            f"a_b-{hashlib.sha1(b'a/b').hexdigest()[:8]}.yml",
+            f"a_b-{hashlib.sha1(b'a_b').hexdigest()[:8]}.yml",
         ]
     )
     assert [path.name for path in files] == expected
-    by_id = {json.loads(path.read_text(encoding="utf-8"))["agent_id"]: path for path in files}
+    by_id = {yaml.safe_load(path.read_text(encoding="utf-8"))["agent_id"]: path for path in files}
     assert set(by_id) == {"a/b", "a_b"}
-    assert json.loads(by_id["a/b"].read_text(encoding="utf-8"))["metadata"] == {"which": "slash"}
-    assert json.loads(by_id["a_b"].read_text(encoding="utf-8"))["metadata"] == {"which": "underscore"}
+    assert yaml.safe_load(by_id["a/b"].read_text(encoding="utf-8"))["metadata"] == {"which": "slash"}
+    assert yaml.safe_load(by_id["a_b"].read_text(encoding="utf-8"))["metadata"] == {"which": "underscore"}
 
 
 def test_manifest_stays_valid_with_parallel_writers(tmp_path):
@@ -1670,7 +1712,7 @@ def test_manifest_stays_valid_with_parallel_writers(tmp_path):
     )
 
     assert rc == 0
-    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    manifest = yaml.safe_load((tmp_path / "manifest.yml").read_text(encoding="utf-8"))
     assert sorted(manifest["agents"]) == [f"corso{index}" for index in range(8)]
     assert len(cli._load_snapshots(str(tmp_path))) == 8
 
@@ -1684,8 +1726,8 @@ def test_duplicate_snapshots_are_applied_once(tmp_path, capsys):
         "plugins": {"foo": {"active": True, "settings": {}}},
         "categories": {},
     }
-    (tmp_path / "a.json").write_text(json.dumps(snapshot), encoding="utf-8")
-    (tmp_path / "b.json").write_text(json.dumps(snapshot), encoding="utf-8")
+    (tmp_path / "a.yml").write_text(yaml.safe_dump(snapshot), encoding="utf-8")
+    (tmp_path / "b.yml").write_text(yaml.safe_dump(snapshot), encoding="utf-8")
 
     rc = cli.main(["--restore", str(tmp_path), "--yes", "--yaml"], client_factory=lambda: client)
 
@@ -2077,7 +2119,7 @@ def test_dump_is_exclusive_with_operations(capsys):
 
 def test_dump_is_exclusive_with_restore(capsys):
     with pytest.raises(SystemExit) as excinfo:
-        cli.main(["--dump", "/tmp/x", "--all", "--restore", "snap.json"], client_factory=_forbidden_factory)
+        cli.main(["--dump", "/tmp/x", "--all", "--restore", "snap.yml"], client_factory=_forbidden_factory)
 
     assert excinfo.value.code == 2
     assert "--restore" in capsys.readouterr().err

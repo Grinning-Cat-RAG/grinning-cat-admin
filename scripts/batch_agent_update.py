@@ -828,17 +828,18 @@ def _exclusive_lock(path: Path) -> Iterator[None]:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    """Write ``payload`` to ``path`` through a same-directory temporary file."""
-    descriptor, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, indent=2))
-        os.replace(temporary, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(temporary)
-        raise
+def _atomic_write_yaml(path: Path, payload: dict[str, Any]) -> None:
+    """Write ``payload`` to ``path`` as YAML through the atomic text writer."""
+    _atomic_write_text(
+        path,
+        yaml.dump(
+            payload,
+            Dumper=_PlainSafeDumper,
+            sort_keys=False,
+            default_flow_style=False,
+            allow_unicode=True,
+        ),
+    )
 
 
 def _write_snapshot(directory: Path, snapshot: dict[str, Any], argv: list[str]) -> None:
@@ -846,19 +847,19 @@ def _write_snapshot(directory: Path, snapshot: dict[str, Any], argv: list[str]) 
     directory.mkdir(parents=True, exist_ok=True)
     agent_id = snapshot["agent_id"]
     safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", agent_id)
-    filename = f"{safe_id}-{hashlib.sha1(agent_id.encode()).hexdigest()[:8]}.json"
-    _atomic_write_json(directory / filename, snapshot)
+    filename = f"{safe_id}-{hashlib.sha1(agent_id.encode()).hexdigest()[:8]}.yml"
+    _atomic_write_yaml(directory / filename, snapshot)
 
-    manifest_path = directory / "manifest.json"
+    manifest_path = directory / "manifest.yml"
     with _SNAPSHOT_LOCK, _exclusive_lock(directory / ".manifest.lock"):
         manifest: dict[str, Any]
         if manifest_path.exists():
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
         else:
             manifest = {"created_at": _utc_now(), "argv": list(argv), "agents": []}
         if agent_id not in manifest["agents"]:
             manifest["agents"].append(agent_id)
-        _atomic_write_json(manifest_path, manifest)
+        _atomic_write_yaml(manifest_path, manifest)
 
 
 def _dump_header(
@@ -1397,13 +1398,13 @@ def _default_backup_dir() -> Path:
 
 
 def _load_snapshots(path: str) -> list[dict[str, Any]]:
-    """Load every snapshot in a file or directory, skipping the manifest."""
+    """Load every YAML snapshot in a file or directory, skipping the manifest."""
     target = Path(path)
     if target.is_dir():
         files = sorted(
             item
-            for item in target.glob("*.json")
-            if item.name != "manifest.json" and not item.name.startswith(".")
+            for item in list(target.glob("*.yml")) + list(target.glob("*.yaml"))
+            if item.name != "manifest.yml" and not item.name.startswith(".")
         )
     else:
         files = [target]
@@ -1412,8 +1413,8 @@ def _load_snapshots(path: str) -> list[dict[str, Any]]:
     seen: set[str] = set()
     for file in files:
         try:
-            data = json.loads(file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            data = yaml.safe_load(file.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError) as exc:
             raise ValueError(f"cannot read snapshot {str(file)!r}: {exc}") from None
         if not isinstance(data, dict) or "agent_id" not in data:
             raise ValueError(f"invalid snapshot {str(file)!r}: missing agent_id")

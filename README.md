@@ -130,8 +130,8 @@ GRINNING_CAT_API_SECURE_CONNECTION=false
 | `--patch FILE` | YAML file (`.yml` or `.yaml`) with per-category patches and `active_plugins` |
 | `--yes` | apply the changes (default: dry-run) |
 | `--yaml` | print the result as YAML |
-| `--backup-out DIR` | directory for the before-snapshot |
-| `--restore PATH` | restore a snapshot file or directory |
+| `--backup-out DIR` | directory for the YAML before-snapshot |
+| `--restore PATH` | restore a YAML snapshot file or directory |
 | `--allow-system-wide` | allow system-wide categories such as embedder |
 | `--max-workers INT` | parallel workers, one task per agent (default: 1) |
 
@@ -173,8 +173,8 @@ The file must contain exactly one YAML document (no `---` separators); YAML anch
 ### Safety
 
 - Dry run by default. `--yes` is required to write anything.
-- Before writing, each agent gets a snapshot under `--backup-out` (default `./agent-backup-<UTC stamp>`).
-- `--restore <dir|file>` re-applies a snapshot and is itself a dry run unless you add `--yes`.
+- Before writing, each agent gets a YAML snapshot (`<agent_id>-<sha1_8>.yml`) under `--backup-out` (default `./agent-backup-<UTC stamp>`); the directory also gets a `manifest.yml`.
+- `--restore <dir|file>` re-applies a YAML snapshot (a directory of `*.yml`/`*.yaml` files or a single file) and is itself a dry run unless you add `--yes`.
 - `--create-missing` is opt-in and never applies to `--all`: only an `--agent` substring that matches nothing becomes a new agent. A created agent has no before-state, so it is not snapshotted.
 - `--allow-system-wide` is required for `embedder` and `ingestion`, because those settings re-embed every agent.
 - `--max-workers > 1` runs one task per agent in parallel.

@@ -12,10 +12,13 @@ import pytest
 
 from grinning_cat_python_sdk.models.api.admins import AgentOutput, AgentUpdatedOutput
 from grinning_cat_python_sdk.models.api.factories import FactoryObjectSettingOutput
+from grinning_cat_python_sdk.models.api.nested.plugins import PluginSettingsOutput
+from grinning_cat_python_sdk.models.api.plugins import PluginToggleOutput
 
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "batch_agent_update.py"
 _spec = importlib.util.spec_from_file_location("batch_agent_update", _SCRIPT)
-assert _spec is not None and _spec.loader is not None
+if _spec is None or _spec.loader is None:  # pragma: no cover - import failure
+    raise RuntimeError(f"cannot import {_SCRIPT}")
 cli = importlib.util.module_from_spec(_spec)
 sys.modules["batch_agent_update"] = cli
 _spec.loader.exec_module(cli)
@@ -119,15 +122,37 @@ class FakeEndpoint:
         return call
 
 
+class FakePlugin:
+    def __init__(self, plugin_id, active):
+        self.id = plugin_id
+        self.local_info = {"active": active}
+
+
+class FakePluginCollection:
+    def __init__(self, installed):
+        self.installed = installed
+
+
 class FakeClient:
     """In-memory stand-in for ``GrinningCatClient``: no network, no Redis."""
 
-    def __init__(self, agents=None, settings=None, fail_on=None, updated_false=None):
+    def __init__(
+        self,
+        agents=None,
+        settings=None,
+        fail_on=None,
+        updated_false=None,
+        plugins=None,
+        toggle_noop=False,
+    ):
         self.calls = []
         self.agents = list(agents or [])
         self.settings = dict(settings or {})
         self.fail_on = set(fail_on or ())
         self.updated_false = set(updated_false or ())
+        self.plugin_states = {agent_id: dict(items) for agent_id, items in (plugins or {}).items()}
+        self.plugin_settings = {}
+        self.toggle_noop = toggle_noop
         for attribute in (
             "utils",
             "large_language_model",
@@ -152,6 +177,27 @@ class FakeClient:
             agent_id, metadata = args
             self.settings[("metadata", agent_id)] = dict(metadata)
             return AgentUpdatedOutput(updated=agent_id not in self.updated_false)
+        if method_name == "get_available_plugins":
+            agent_id = args[0]
+            installed = [
+                FakePlugin(plugin_id, active)
+                for plugin_id, active in self.plugin_states.get(agent_id, {}).items()
+            ]
+            return FakePluginCollection(installed)
+        if method_name == "put_toggle_plugin":
+            plugin_id, agent_id = args
+            state = self.plugin_states.setdefault(agent_id, {})
+            if plugin_id not in state:
+                raise RuntimeError(f"plugin {plugin_id!r} is not installed for agent {agent_id!r}")
+            if not self.toggle_noop:
+                state[plugin_id] = not state[plugin_id]
+            return PluginToggleOutput(info="toggled")
+        if method_name == "put_plugin_settings":
+            plugin_id, agent_id, values = args
+            key = (agent_id, plugin_id)
+            merged = {**self.plugin_settings.get(key, {}), **values}
+            self.plugin_settings[key] = merged
+            return PluginSettingsOutput(name=plugin_id, value=merged)
         if method_name.startswith("get_"):
             name = args[0]
             return FactoryObjectSettingOutput(name=name, value=dict(self.settings.get((attribute, name), {})))
@@ -366,3 +412,426 @@ def test_set_nested_replaces_a_scalar_branch():
 def test_set_nested_rejects_an_empty_key():
     with pytest.raises(ValueError):
         cli.set_nested({}, "", 1)
+
+
+def test_llm_merges_and_preserves_untouched_keys_on_two_agents():
+    client = FakeClient(
+        agents=[_agent("corso1"), _agent("corso2")],
+        settings={
+            ("large_language_model", "gpt-4"): {"model": "gpt-4", "temperature": 0.0, "max_tokens": 100},
+        },
+    )
+
+    rc = cli.main(
+        ["--agent", "corso", "--llm", 'gpt-4={"temperature": 0.2}', "--yes"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert len(client.calls_to("get_large_language_model_settings")) == 2
+    puts = client.calls_to("put_large_language_model_settings")
+    assert len(puts) == 2
+    for name, agent_id, values in puts:
+        assert name == "gpt-4"
+        assert agent_id in {"corso1", "corso2"}
+        assert values == {"model": "gpt-4", "temperature": 0.2, "max_tokens": 100}
+
+
+def test_llm_non_object_patch_exits_2_without_calls(capsys):
+    client = FakeClient(agents=[_agent("corso1")])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--agent", "corso", "--llm", "gpt-4=0.2", "--yes"], client_factory=lambda: client)
+
+    assert excinfo.value.code == 2
+    assert "gpt-4=0.2" in capsys.readouterr().err
+    assert client.calls == []
+
+
+def test_llm_invalid_json_exits_2_without_calls(capsys):
+    client = FakeClient(agents=[_agent("corso1")])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--agent", "corso", "--llm", "gpt-4={bad}", "--yes"], client_factory=lambda: client)
+
+    assert excinfo.value.code == 2
+    assert "gpt-4={bad}" in capsys.readouterr().err
+    assert client.calls == []
+
+
+def test_llm_failure_surfaces_as_agent_failure():
+    client = FakeClient(agents=[_agent("corso1")], fail_on={"put_large_language_model_settings"})
+
+    rc = cli.main(["--agent", "corso", "--llm", "gpt-4={}", "--yes"], client_factory=lambda: client)
+
+    assert rc == 1
+
+
+def test_plugin_already_active_is_not_toggled():
+    client = FakeClient(agents=[_agent("corso1")], plugins={"corso1": {"foo": True}})
+
+    rc = cli.main(["--agent", "corso", "--plugin", "foo=on", "--yes"], client_factory=lambda: client)
+
+    assert rc == 0
+    assert client.calls_to("put_toggle_plugin") == []
+    assert client.plugin_states["corso1"]["foo"] is True
+
+
+def test_plugin_inactive_is_toggled_once_and_verified():
+    client = FakeClient(agents=[_agent("corso1")], plugins={"corso1": {"foo": False}})
+
+    rc = cli.main(["--agent", "corso", "--plugin", "foo=on", "--yes"], client_factory=lambda: client)
+
+    assert rc == 0
+    assert client.calls_to("put_toggle_plugin") == [("foo", "corso1")]
+    assert client.plugin_states["corso1"]["foo"] is True
+    assert len(client.calls_to("get_available_plugins")) == 2
+
+
+def test_plugin_off_toggles_an_active_plugin():
+    client = FakeClient(agents=[_agent("corso1")], plugins={"corso1": {"foo": True}})
+
+    rc = cli.main(["--agent", "corso", "--plugin", "foo=off", "--yes"], client_factory=lambda: client)
+
+    assert rc == 0
+    assert client.calls_to("put_toggle_plugin") == [("foo", "corso1")]
+    assert client.plugin_states["corso1"]["foo"] is False
+
+
+def test_plugin_command_twice_toggles_once():
+    client = FakeClient(agents=[_agent("corso1")], plugins={"corso1": {"foo": False}})
+
+    first = cli.main(["--agent", "corso", "--plugin", "foo=on", "--yes"], client_factory=lambda: client)
+    second = cli.main(["--agent", "corso", "--plugin", "foo=on", "--yes"], client_factory=lambda: client)
+
+    assert (first, second) == (0, 0)
+    assert client.calls_to("put_toggle_plugin") == [("foo", "corso1")]
+
+
+def test_plugin_not_installed_fails_that_agent_only(capsys):
+    client = FakeClient(
+        agents=[_agent("corso1"), _agent("corso2")],
+        plugins={"corso1": {}, "corso2": {"foo": False}},
+    )
+
+    rc = cli.main(["--agent", "corso", "--plugin", "foo=on", "--yes"], client_factory=lambda: client)
+
+    assert rc == 1
+    assert client.plugin_states["corso2"]["foo"] is True
+    assert client.calls_to("put_toggle_plugin") == [("foo", "corso2")]
+    out = capsys.readouterr().out
+    assert "agent=corso1 op=plugin:foo result=failed" in out
+    assert "is not installed" in out
+
+
+def test_plugin_toggle_that_does_not_change_state_fails():
+    client = FakeClient(
+        agents=[_agent("corso1")],
+        plugins={"corso1": {"foo": False}},
+        toggle_noop=True,
+    )
+
+    rc = cli.main(["--agent", "corso", "--plugin", "foo=on", "--yes"], client_factory=lambda: client)
+
+    assert rc == 1
+    assert client.calls_to("put_toggle_plugin") == [("foo", "corso1")]
+
+
+def test_plugin_invalid_state_exits_2_without_calls(capsys):
+    client = FakeClient(agents=[_agent("corso1")])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--agent", "corso", "--plugin", "foo=maybe", "--yes"], client_factory=lambda: client)
+
+    assert excinfo.value.code == 2
+    assert "foo=maybe" in capsys.readouterr().err
+    assert client.calls == []
+
+
+def test_metadata_merge_preserves_existing_keys():
+    client = FakeClient(agents=[_agent("corso1", {"public": True, "label": "a"})])
+
+    rc = cli.main(["--agent", "corso", "--metadata", "label=b", "--yes"], client_factory=lambda: client)
+
+    assert rc == 0
+    assert client.calls_to("put_agent") == [("corso1", {"public": True, "label": "b"})]
+
+
+def test_name_sets_name_and_keeps_other_keys():
+    client = FakeClient(agents=[_agent("corso1", {"public": True})])
+
+    rc = cli.main(["--agent", "corso", "--name", "Nuovo", "--yes"], client_factory=lambda: client)
+
+    assert rc == 0
+    assert client.calls_to("put_agent") == [("corso1", {"public": True, "name": "Nuovo"})]
+
+
+def test_name_wins_over_metadata_name():
+    client = FakeClient(agents=[_agent("corso1")])
+
+    rc = cli.main(
+        ["--agent", "corso", "--metadata", "name=old", "--name", "new", "--yes"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert client.calls_to("put_agent") == [("corso1", {"name": "new"})]
+
+
+def test_metadata_values_are_json_parsed():
+    client = FakeClient(agents=[_agent("corso1")])
+
+    rc = cli.main(
+        [
+            "--agent",
+            "corso",
+            "--metadata",
+            "public=true",
+            "--metadata",
+            "n=3",
+            "--metadata",
+            "label=x",
+            "--yes",
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert client.calls_to("put_agent") == [("corso1", {"public": True, "n": 3, "label": "x"})]
+
+
+def test_updated_false_fails_the_agent(capsys):
+    client = FakeClient(agents=[_agent("corso1")], updated_false={"corso1"})
+
+    rc = cli.main(["--agent", "corso", "--metadata", "label=b", "--yes"], client_factory=lambda: client)
+
+    assert rc == 1
+    assert "updated=false for corso1" in capsys.readouterr().out
+
+
+def test_metadata_without_equals_exits_2_without_calls(capsys):
+    client = FakeClient(agents=[_agent("corso1")])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--agent", "corso", "--metadata", "label", "--yes"], client_factory=lambda: client)
+
+    assert excinfo.value.code == 2
+    assert "label" in capsys.readouterr().err
+    assert client.calls == []
+
+
+def test_set_chunking_writes_an_int():
+    client = FakeClient(
+        agents=[_agent("corso1")],
+        settings={("chunker", "default"): {"chunk_size": 256, "chunk_overlap": 32}},
+    )
+
+    rc = cli.main(
+        ["--agent", "corso", "--set", "chunking:default:chunk_size=512", "--yes"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert client.calls_to("put_chunker_settings") == [
+        ("default", "corso1", {"chunk_size": 512, "chunk_overlap": 32})
+    ]
+
+
+def test_set_dotted_key_creates_nested_branch():
+    client = FakeClient(
+        agents=[_agent("corso1")],
+        settings={("large_language_model", "gpt-4"): {"model": "gpt-4"}},
+    )
+
+    rc = cli.main(["--agent", "corso", "--set", "llm:gpt-4:a.b=1", "--yes"], client_factory=lambda: client)
+
+    assert rc == 0
+    assert client.calls_to("put_large_language_model_settings") == [
+        ("gpt-4", "corso1", {"model": "gpt-4", "a": {"b": 1}})
+    ]
+
+
+def test_patch_file_writes_each_pair_once(tmp_path):
+    patch_file = tmp_path / "patch.json"
+    patch_file.write_text(
+        json.dumps(
+            {
+                "llm": {"gpt-4": {"temperature": 0.2}},
+                "plugins": {"foo": {"k": "v"}},
+                "metadata": {"name": "X"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = FakeClient(
+        agents=[_agent("corso1", {"public": True})],
+        settings={("large_language_model", "gpt-4"): {"model": "gpt-4"}},
+        plugins={"corso1": {"foo": True}},
+    )
+
+    rc = cli.main(["--agent", "corso", "--patch", str(patch_file), "--yes"], client_factory=lambda: client)
+
+    assert rc == 0
+    assert client.calls_to("put_large_language_model_settings") == [
+        ("gpt-4", "corso1", {"model": "gpt-4", "temperature": 0.2})
+    ]
+    assert client.calls_to("put_plugin_settings") == [("foo", "corso1", {"k": "v"})]
+    assert client.calls_to("put_agent") == [("corso1", {"public": True, "name": "X"})]
+
+
+def test_patch_and_set_are_coalesced(tmp_path):
+    patch_file = tmp_path / "patch.json"
+    patch_file.write_text(
+        json.dumps({"llm": {"gpt-4": {"temperature": 0.2, "max_tokens": 10}}}),
+        encoding="utf-8",
+    )
+    client = FakeClient(
+        agents=[_agent("corso1")],
+        settings={("large_language_model", "gpt-4"): {"model": "gpt-4"}},
+    )
+
+    rc = cli.main(
+        [
+            "--agent",
+            "corso",
+            "--patch",
+            str(patch_file),
+            "--set",
+            "llm:gpt-4:temperature=0.5",
+            "--yes",
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    puts = client.calls_to("put_large_language_model_settings")
+    assert len(puts) == 1
+    assert puts[0][2] == {"model": "gpt-4", "temperature": 0.5, "max_tokens": 10}
+
+
+def test_unknown_category_exits_2_without_calls(capsys):
+    client = FakeClient(agents=[_agent("corso1")])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--agent", "corso", "--set", "nope:x:y=1", "--yes"], client_factory=lambda: client)
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "nope" in err
+    assert "llm" in err
+    assert client.calls == []
+
+
+def test_invalid_patch_shape_exits_2_without_calls(tmp_path, capsys):
+    patch_file = tmp_path / "patch.json"
+    patch_file.write_text(json.dumps({"llm": {"gpt-4": 0.2}}), encoding="utf-8")
+    client = FakeClient(agents=[_agent("corso1")])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--agent", "corso", "--patch", str(patch_file), "--yes"], client_factory=lambda: client)
+
+    assert excinfo.value.code == 2
+    assert "gpt-4" in capsys.readouterr().err
+    assert client.calls == []
+
+
+def test_malformed_set_exits_2_with_grammar(capsys):
+    client = FakeClient(agents=[_agent("corso1")])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--agent", "corso", "--set", "llm:gpt-4", "--yes"], client_factory=lambda: client)
+
+    assert excinfo.value.code == 2
+    assert "CATEGORY:NAME:KEY=VALUE" in capsys.readouterr().err
+    assert client.calls == []
+
+
+def test_embedder_is_rejected_as_system_wide(capsys):
+    client = FakeClient(agents=[_agent("corso1")])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--agent", "corso", "--set", "embedder:openai:key=x", "--yes"], client_factory=lambda: client)
+
+    assert excinfo.value.code == 2
+    assert "system-wide" in capsys.readouterr().err
+    assert client.calls == []
+
+
+def test_max_workers_above_one_exits_2(capsys):
+    client = FakeClient(agents=[_agent("corso1")])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(
+            ["--agent", "corso", "--metadata", "a=b", "--max-workers", "2", "--yes"],
+            client_factory=lambda: client,
+        )
+
+    assert excinfo.value.code == 2
+    assert "--max-workers" in capsys.readouterr().err
+    assert client.calls == []
+
+
+def test_yes_happy_path_json_report(capsys):
+    client = FakeClient(agents=[_agent("corso1", {"public": True})])
+
+    rc = cli.main(
+        ["--agent", "corso", "--metadata", "label=b", "--yes", "--json"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert isinstance(payload, list)
+    assert payload[0]["agent_id"] == "corso1"
+    assert payload[0]["ok"] is True
+    assert payload[0]["ops"] == [{"op": "metadata", "status": "ok", "detail": "updated"}]
+    assert payload[0]["error"] is None
+
+
+def test_human_mode_prints_one_line_per_op(capsys):
+    client = FakeClient(agents=[_agent("corso1")])
+
+    rc = cli.main(["--agent", "corso", "--metadata", "label=b", "--yes"], client_factory=lambda: client)
+
+    assert rc == 0
+    assert "[batch] agent=corso1 op=metadata result=ok" in capsys.readouterr().out
+
+
+def test_failed_op_prints_reason(capsys):
+    client = FakeClient(agents=[_agent("corso1")], updated_false={"corso1"})
+
+    rc = cli.main(["--agent", "corso", "--metadata", "label=b", "--yes"], client_factory=lambda: client)
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "result=failed" in out
+    assert "updated=false for corso1" in out
+
+
+def test_operation_order_is_metadata_llm_plugins_settings():
+    client = FakeClient(
+        agents=[_agent("corso1")],
+        settings={("large_language_model", "gpt-4"): {"model": "gpt-4"}},
+        plugins={"corso1": {"foo": True}},
+    )
+
+    rc = cli.main(
+        [
+            "--agent",
+            "corso",
+            "--set",
+            "chunking:default:chunk_size=512",
+            "--plugin",
+            "foo=on",
+            "--llm",
+            "gpt-4={}",
+            "--metadata",
+            "label=b",
+            "--yes",
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    write_calls = [name for name, _args in client.calls if name.startswith("put_")]
+    assert write_calls == ["put_agent", "put_large_language_model_settings", "put_chunker_settings"]

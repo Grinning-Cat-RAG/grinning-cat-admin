@@ -11,6 +11,7 @@ operation failed, 2 = dry-run, abort or usage error.
 import argparse
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -186,6 +187,257 @@ def set_nested(d: dict[str, Any], dotted_key: str, value: Any) -> None:
     target[parts[-1]] = value
 
 
+@dataclass(frozen=True)
+class Operation:
+    """One requested change, applied to every selected agent."""
+
+    kind: str
+    name: str
+    payload: Any
+    category: str = ""
+
+
+SYSTEM_WIDE_CATEGORIES = {"embedder", "ingestion"}
+VALID_CATEGORIES = {"metadata", "plugins", *FACTORY_CATEGORIES, *SYSTEM_WIDE_CATEGORIES}
+_OPERATION_ORDER = {"metadata": 0, "llm": 1, "plugin": 2, "settings": 3}
+_PLUGIN_STATES = {"on": True, "true": True, "1": True, "off": False, "false": False, "0": False}
+
+
+def _parse_value(raw: str) -> Any:
+    """Decode a CLI value as JSON, falling back to the raw string."""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+
+
+def parse_llm(items: list[str]) -> list[tuple[str, dict[str, Any]]]:
+    """Parse ``MODEL=JSON`` items; the JSON side must be an object."""
+    parsed = []
+    for item in items:
+        model, separator, raw = item.partition("=")
+        if not separator or not model:
+            raise ValueError(f"invalid --llm {item!r}: expected MODEL=JSON")
+        try:
+            patch = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid --llm {item!r}: {exc}") from None
+        if not isinstance(patch, dict):
+            raise ValueError(f"invalid --llm {item!r}: the JSON value must be an object")
+        parsed.append((model, patch))
+    return parsed
+
+
+def parse_plugins(items: list[str]) -> list[tuple[str, bool]]:
+    """Parse ``NAME=on|off`` items, accepting true/false/1/0 as well."""
+    parsed = []
+    for item in items:
+        name, separator, raw = item.partition("=")
+        if not separator or not name:
+            raise ValueError(f"invalid --plugin {item!r}: expected NAME=on|off")
+        desired = _PLUGIN_STATES.get(raw.strip().lower())
+        if desired is None:
+            raise ValueError(f"invalid --plugin {item!r}: expected NAME=on|off")
+        parsed.append((name, desired))
+    return parsed
+
+
+def parse_metadata_pairs(items: list[str]) -> dict[str, Any]:
+    """Parse ``KEY=VALUE`` items, decoding VALUE as JSON when possible."""
+    updates = {}
+    for item in items:
+        key, separator, raw = item.partition("=")
+        if not separator or not key:
+            raise ValueError(f"invalid --metadata {item!r}: expected KEY=VALUE")
+        updates[key] = _parse_value(raw)
+    return updates
+
+
+def parse_set(items: list[str]) -> dict[tuple[str, str], dict[str, Any]]:
+    """Parse ``CATEGORY:NAME:KEY=VALUE`` items into per-target patches."""
+    patches: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in items:
+        parts = item.split(":", 2)
+        if len(parts) != 3:
+            raise ValueError(f"invalid --set {item!r}: expected CATEGORY:NAME:KEY=VALUE")
+        category, name, assignment = parts
+        key, separator, raw = assignment.partition("=")
+        if not category or not name or not separator or not key:
+            raise ValueError(f"invalid --set {item!r}: expected CATEGORY:NAME:KEY=VALUE")
+        patch = patches.setdefault((category, name), {})
+        set_nested(patch, key, _parse_value(raw))
+    return patches
+
+
+def load_patch(path: str) -> dict[tuple[str, str], dict[str, Any]]:
+    """Load a ``{category: {name: patch}}`` JSON file into per-target patches."""
+    try:
+        raw = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"cannot read --patch {path!r}: {exc}") from None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON in --patch {path!r}: {exc}") from None
+    if not isinstance(data, dict):
+        raise ValueError(f"invalid --patch {path!r}: the top level must be a JSON object")
+
+    patches: dict[tuple[str, str], dict[str, Any]] = {}
+    for category, entries in data.items():
+        if not isinstance(entries, dict):
+            raise ValueError(f"invalid --patch {path!r}: category {category!r} must be an object")
+        if category == "metadata":
+            patches[("metadata", "")] = dict(entries)
+            continue
+        for name, patch in entries.items():
+            if not isinstance(patch, dict):
+                raise ValueError(f"invalid --patch {path!r}: {category}:{name} must be an object")
+            patches[(category, name)] = patch
+    return patches
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _validate_categories(patches: dict[tuple[str, str], dict[str, Any]]) -> None:
+    for category, _name in patches:
+        if category in SYSTEM_WIDE_CATEGORIES:
+            raise ValueError(f"{category} is system-wide; --allow-system-wide is not implemented yet")
+        if category not in VALID_CATEGORIES:
+            valid = ", ".join(sorted(VALID_CATEGORIES))
+            raise ValueError(f"unknown category {category!r}; valid categories: {valid}")
+
+
+def _build_operations(args: argparse.Namespace) -> list[Operation]:
+    """Parse every operation before the first write, so a typo aborts the run."""
+    patches = load_patch(args.patch) if args.patch else {}
+    for key, patch in parse_set(args.set or []).items():
+        patches[key] = _deep_merge(patches.get(key, {}), patch)
+
+    metadata_payload: dict[str, Any] = {}
+    for (category, _name), patch in patches.items():
+        if category == "metadata":
+            metadata_payload = _deep_merge(metadata_payload, patch)
+    metadata_payload = _deep_merge(metadata_payload, parse_metadata_pairs(args.metadata or []))
+    if args.name is not None:
+        metadata_payload["name"] = args.name
+
+    _validate_categories(patches)
+
+    operations = []
+    if metadata_payload:
+        operations.append(Operation(kind="metadata", name="", payload=metadata_payload))
+    for model, patch in parse_llm(args.llm or []):
+        operations.append(Operation(kind="llm", name=model, payload=patch))
+    for name, desired in parse_plugins(args.plugin or []):
+        operations.append(Operation(kind="plugin", name=name, payload=desired))
+    for (category, name), patch in patches.items():
+        if category == "metadata":
+            continue
+        operations.append(Operation(kind="settings", category=category, name=name, payload=patch))
+    return operations
+
+
+def update_metadata(client: Any, agent: AgentOutput, updates: dict[str, Any]) -> dict[str, Any]:
+    """Merge ``updates`` into the agent metadata and PUT the whole dict.
+
+    The core replaces the metadata dict, so the merge is mandatory: a blind
+    PUT would drop every key the update does not mention.
+    """
+    merged = {**agent.metadata, **updates}
+    result = client.utils.put_agent(agent.agent_id, merged)
+    if not result.updated:
+        raise RuntimeError(f"updated=false for {agent.agent_id}")
+    return merged
+
+
+def reconcile_plugin(client: Any, agent_id: str, name: str, desired: bool) -> str:
+    """Bring one plugin to ``desired`` state, tolerating the core's flip toggle.
+
+    The core endpoint flips the active flag instead of setting it, so the
+    current state is read first and the result is verified afterwards: a
+    repeated command must never toggle twice.
+    """
+    collection = client.plugins.get_available_plugins(agent_id)
+    item = next((plugin for plugin in collection.installed if plugin.id == name), None)
+    if item is None:
+        raise RuntimeError(f"plugin {name!r} is not installed for agent {agent_id!r}")
+
+    active = bool(item.local_info.get("active", False))
+    if active == desired:
+        return "already-on" if desired else "already-off"
+
+    client.plugins.put_toggle_plugin(name, agent_id)
+
+    collection = client.plugins.get_available_plugins(agent_id)
+    item = next((plugin for plugin in collection.installed if plugin.id == name), None)
+    if item is None:
+        raise RuntimeError(f"plugin {name!r} disappeared from agent {agent_id!r} after toggling")
+    if bool(item.local_info.get("active", False)) != desired:
+        raise RuntimeError(f"toggle did not change state for plugin {name!r} on agent {agent_id!r}")
+
+    return "toggled-on" if desired else "toggled-off"
+
+
+def _operation_label(operation: Operation) -> str:
+    if operation.kind == "settings":
+        return f"settings:{operation.category}:{operation.name}"
+    if operation.kind in ("llm", "plugin"):
+        return f"{operation.kind}:{operation.name}"
+    return operation.kind
+
+
+def _apply_operation(client: Any, agent: AgentOutput, operation: Operation) -> str:
+    if operation.kind == "metadata":
+        update_metadata(client, agent, operation.payload)
+        return "updated"
+    if operation.kind == "llm":
+        merge_factory_setting(client, "llm", operation.name, operation.payload, agent.agent_id)
+        return "merged"
+    if operation.kind == "plugin":
+        return reconcile_plugin(client, agent.agent_id, operation.name, operation.payload)
+    if operation.kind == "settings":
+        if operation.category == "plugins":
+            client.plugins.put_plugin_settings(operation.name, agent.agent_id, operation.payload)
+            return "merged"
+        merge_factory_setting(client, operation.category, operation.name, operation.payload, agent.agent_id)
+        return "merged"
+    raise NotImplementedError(f"operation {operation.kind!r} is not implemented yet")
+
+
+def execute_batch(
+    client: Any, selected: list[AgentOutput], operations: list[Operation]
+) -> list[dict[str, Any]]:
+    """Apply every operation to every agent, isolating failures per agent and per op."""
+    ordered = sorted(operations, key=lambda operation: _OPERATION_ORDER[operation.kind])
+    results = []
+    for agent in selected:
+        result: dict[str, Any] = {"agent_id": agent.agent_id, "ok": True, "ops": [], "error": None}
+        try:
+            for operation in ordered:
+                try:
+                    detail = _apply_operation(client, agent, operation)
+                except Exception as exc:  # noqa: BLE001 - one operation must not abort the agent
+                    result["ops"].append(
+                        {"op": _operation_label(operation), "status": "failed", "detail": str(exc)}
+                    )
+                    result["ok"] = False
+                else:
+                    result["ops"].append({"op": _operation_label(operation), "status": "ok", "detail": detail})
+        except Exception as exc:  # noqa: BLE001 - one agent must not abort the run
+            result["ok"] = False
+            result["error"] = str(exc)
+        results.append(result)
+    return results
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="batch_agent_update.py",
@@ -305,9 +557,17 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
 
     _validate(parser, args)
 
+    if args.max_workers != 1:
+        parser.error("--max-workers > 1 is not implemented yet")
+
     if args.restore:
         print("--restore is not implemented yet", file=sys.stderr)
         return 2
+
+    try:
+        operations = _build_operations(args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     client = client_factory()
     if client is None:
@@ -328,23 +588,35 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
     ops = _operations(args)
     metadata_keys = _metadata_keys(args)
 
-    if args.json:
-        print(
-            json.dumps(
-                [{"agent": agent.agent_id, "ops": ops, "metadata_keys": metadata_keys} for agent in selected],
-                indent=2,
-            )
-        )
-    else:
-        for line in render_plan(selected, ops, metadata_keys):
-            print(line)
-
     if not args.yes:
+        if args.json:
+            print(
+                json.dumps(
+                    [{"agent": agent.agent_id, "ops": ops, "metadata_keys": metadata_keys} for agent in selected],
+                    indent=2,
+                )
+            )
+        else:
+            for line in render_plan(selected, ops, metadata_keys):
+                print(line)
         print("dry-run: no changes written (pass --yes to apply)", file=sys.stderr)
         return 2
 
-    print("execution is not implemented yet", file=sys.stderr)
-    return 2
+    results = execute_batch(client, selected, operations)
+
+    if args.json:
+        print(json.dumps(results, indent=2))
+    else:
+        for result in results:
+            for operation in result["ops"]:
+                line = f"[batch] agent={result['agent_id']} op={operation['op']} result={operation['status']}"
+                if operation["status"] == "failed":
+                    line += f" reason={operation['detail']}"
+                print(line)
+            if result["error"]:
+                print(f"[batch] agent={result['agent_id']} error={result['error']}", file=sys.stderr)
+
+    return 0 if all(result["ok"] for result in results) else 1
 
 
 if __name__ == "__main__":

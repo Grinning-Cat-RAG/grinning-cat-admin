@@ -47,14 +47,20 @@ def select_agents(
     include_all: bool,
     exclude: list[str],
     include_internal: bool = False,
+    create_missing: bool = False,
+    created_out: list[str] | None = None,
 ) -> list[AgentOutput]:
     """Pick the agents to update, preserving the order of ``agents``.
 
     ``--all`` skips the ``system`` agent and every ``__*`` internal agent,
     unless ``include_internal`` is set (the dump mode wants them).
     A substring that matches nothing is fatal: silently updating a smaller
-    set than the operator asked for is the worst failure mode here.
+    set than the operator asked for is the worst failure mode here. With
+    ``create_missing`` such a substring becomes a synthetic agent instead,
+    and its id is appended to ``created_out`` when the caller passes one.
+    ``--all`` never creates: it only ever selects existing agents.
     """
+    synthetic: set[str] = set()
     if include_all:
         if include_internal:
             candidates = list(agents)
@@ -67,8 +73,12 @@ def select_agents(
         for substring in substrings:
             matches = [a for a in agents if substring.lower() in a.agent_id.lower()]
             if not matches:
-                raise SelectionError(f"no agent id contains {substring!r}")
-            candidates.extend(matches)
+                if not create_missing:
+                    raise SelectionError(f"no agent id contains {substring!r}")
+                candidates.append(AgentOutput(agent_id=substring, metadata={}))
+                synthetic.add(substring)
+            else:
+                candidates.extend(matches)
 
     excluded = [substring.lower() for substring in exclude]
     selected = []
@@ -83,6 +93,8 @@ def select_agents(
 
     if not selected:
         raise SelectionError("no agents selected")
+    if created_out is not None:
+        created_out.extend(agent.agent_id for agent in selected if agent.agent_id in synthetic)
     return selected
 
 
@@ -1209,9 +1221,16 @@ def _run_agent(
     ordered: list[Operation],
     snapshot_dir: Path | None,
     argv: list[str],
+    created: bool = False,
 ) -> dict[str, Any]:
-    """Read every state, snapshot, then write: one agent never aborts the run."""
+    """Read every state, snapshot, then write: one agent never aborts the run.
+
+    ``created`` marks an agent this run just created: there is no before-state
+    to snapshot, so the snapshot step is skipped and the result says so.
+    """
     result: dict[str, Any] = {"agent_id": agent.agent_id, "ok": True, "ops": [], "error": None}
+    if created:
+        result["created"] = True
     try:
         states: list[Any] = []
         for operation in ordered:
@@ -1224,7 +1243,7 @@ def _run_agent(
                 )
                 result["ok"] = False
 
-        if snapshot_dir is not None:
+        if snapshot_dir is not None and not created:
             try:
                 snapshot = _build_snapshot(agent, ordered, states, client)
                 _write_snapshot(snapshot_dir, snapshot, argv)
@@ -1260,12 +1279,15 @@ def execute_batch(
     argv: list[str] | None = None,
     max_workers: int = 1,
     missing: set[str] | None = None,
+    create: set[str] | None = None,
 ) -> dict[str, Any]:
     """Apply every operation, isolating failures per agent and per operation.
 
     ``operations`` is either one list applied to every agent or a per-agent
     mapping (used by ``--restore``). System-wide operations run exactly once,
-    after the per-agent loop.
+    after the per-agent loop. Agents in ``create`` are created first; a failed
+    creation fails only that agent. ``missing`` keeps its restore semantics
+    unless the same agent is also in ``create``.
     """
     argv = list(argv or [])
     if isinstance(operations, dict):
@@ -1281,14 +1303,34 @@ def execute_batch(
             return ordered
 
     def run(agent: AgentOutput) -> dict[str, Any]:
-        if missing and agent.agent_id in missing:
+        created = bool(create and agent.agent_id in create)
+        if created:
+            try:
+                output = client.utils.post_agent_create(agent.agent_id, agent.metadata)
+            except Exception as exc:  # noqa: BLE001 - one agent must not abort the run
+                return {
+                    "agent_id": agent.agent_id,
+                    "ok": False,
+                    "ops": [],
+                    "error": f"create failed: {exc}",
+                    "created": False,
+                }
+            if not getattr(output, "created", False):
+                return {
+                    "agent_id": agent.agent_id,
+                    "ok": False,
+                    "ops": [],
+                    "error": "create failed: the server returned created=false",
+                    "created": False,
+                }
+        if missing and agent.agent_id in missing and not created:
             return {
                 "agent_id": agent.agent_id,
                 "ok": False,
                 "ops": [],
                 "error": "agent not found on the server",
             }
-        return _run_agent(client, agent, ordered_for(agent), snapshot_dir, argv)
+        return _run_agent(client, agent, ordered_for(agent), snapshot_dir, argv, created=created)
 
     if max_workers > 1:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1516,6 +1558,10 @@ examples:
   #    Verify a dump against the live configuration; exit 0 means identical.
   uv run python scripts/batch_agent_update.py --dump ./dump --all --diff
 
+  # 8. Create an agent that does not exist yet, then configure it in the same run.
+  #    --create-missing only applies to --agent substrings that match nothing; --all never creates.
+  uv run python scripts/batch_agent_update.py --agent nuovo --create-missing --patch examples/patch-full-agent.yml
+
   # Safety: dry-run is the default; --yes writes; exit codes 0 = ok, 1 = failure, 2 = dry-run/abort.
 """
 
@@ -1537,6 +1583,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--all",
         action="store_true",
         help="every agent except system and __*",
+    )
+    parser.add_argument(
+        "--create-missing",
+        action="store_true",
+        help="create an agent when --agent matches nothing (never with --all)",
     )
     parser.add_argument(
         "--exclude",
@@ -1641,6 +1692,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _validate(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """Reject impossible command lines before any client is built."""
+    if args.create_missing:
+        if args.all:
+            parser.error("--create-missing cannot be combined with --all")
+        dump_flags = [
+            name
+            for name in ("dump", "diff", "dump_only", "dump_secrets", "dump_manifest_only")
+            if getattr(args, name)
+        ]
+        if dump_flags:
+            parser.error(
+                f"--create-missing cannot be combined with --{dump_flags[0].replace('_', '-')}"
+            )
+
     if args.dump:
         conflicting = [flag for flag in OPERATION_FLAGS if getattr(args, flag)]
         if args.restore:
@@ -1803,6 +1867,7 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
         return 1
 
     missing: set[str] | None = None
+    created_ids: list[str] = []
     if snapshots is not None:
         by_id = {agent.agent_id: agent for agent in agents}
         selected = []
@@ -1825,6 +1890,8 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
                 args.all,
                 args.exclude or [],
                 include_internal=bool(args.dump),
+                create_missing=args.create_missing,
+                created_out=created_ids,
             )
         except SelectionError as exc:
             print(str(exc), file=sys.stderr)
@@ -1837,6 +1904,13 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
             for key in operation.payload
         )
 
+    create_ids = set(created_ids)
+    if snapshots is not None and args.create_missing:
+        create_ids = set(missing or ())
+
+    def plan_ops_for(agent_id: str) -> list[str]:
+        return ["create", *plan_ops] if agent_id in create_ids else plan_ops
+
     if not args.yes:
         if args.json:
             print(
@@ -1846,7 +1920,7 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
                         "agents": [
                             {
                                 "agent": agent.agent_id,
-                                "ops": plan_ops,
+                                "ops": plan_ops_for(agent.agent_id),
                                 "metadata_keys": plan_metadata_keys,
                             }
                             for agent in selected
@@ -1857,8 +1931,9 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
                 )
             )
         else:
-            for line in render_plan(selected, plan_ops, plan_metadata_keys):
-                print(line)
+            for agent in selected:
+                for line in render_plan([agent], plan_ops_for(agent.agent_id), plan_metadata_keys):
+                    print(line)
             print(f"system-wide: {len(system_wide)}")
         print("dry-run: no changes written (pass --yes to apply)", file=sys.stderr)
         return 2
@@ -1874,6 +1949,7 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
         argv=list(argv) if argv is not None else sys.argv[1:],
         max_workers=args.max_workers,
         missing=missing,
+        create=create_ids or None,
     )
     _report(envelope, args.json)
     return _exit_code(envelope)

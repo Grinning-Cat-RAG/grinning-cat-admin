@@ -14,7 +14,11 @@ from pathlib import Path
 import pytest
 import yaml
 
-from grinning_cat_python_sdk.models.api.admins import AgentOutput, AgentUpdatedOutput
+from grinning_cat_python_sdk.models.api.admins import (
+    AgentCreatedOutput,
+    AgentOutput,
+    AgentUpdatedOutput,
+)
 from grinning_cat_python_sdk.models.api.factories import (
     FactoryObjectSettingOutput,
     FactoryObjectSettingsOutput,
@@ -50,6 +54,7 @@ def test_help_lists_every_flag(capsys):
     for flag in (
         "--agent",
         "--all",
+        "--create-missing",
         "--exclude",
         "--llm",
         "--plugin",
@@ -82,6 +87,7 @@ def test_help_includes_examples(capsys):
         "--set plugins:",
         "--patch",
         "--restore",
+        "--create-missing",
         "--allow-system-wide",
         "--max-workers",
     ):
@@ -268,9 +274,12 @@ class FakeClient:
         factory_lists=None,
         plugin_settings_500_inactive=False,
         plugin_settings_fail=None,
+        create_false=None,
     ):
         self.calls = []
         self.agents = list(agents or [])
+        self.created = []
+        self.create_false = set(create_false or ())
         self.settings = dict(settings or {})
         self.fail_on = set(fail_on or ())
         self.updated_false = set(updated_false or ())
@@ -326,6 +335,14 @@ class FakeClient:
             raise RuntimeError(f"{method_name} failed for {agent_id}")
         if method_name == "get_agents":
             return list(self.agents)
+        if method_name == "post_agent_create":
+            agent_id, metadata = args
+            self.created.append((agent_id, dict(metadata or {})))
+            if agent_id in self.create_false:
+                return AgentCreatedOutput(created=False)
+            self.agents.append(_agent(agent_id, metadata))
+            self._agent_ids.add(agent_id)
+            return AgentCreatedOutput(created=True)
         if method_name == "put_agent":
             agent_id, metadata = args
             self.settings[("metadata", agent_id)] = dict(metadata)
@@ -3357,3 +3374,230 @@ def test_dump_manifest_only_tolerates_a_system_without_plugin_manager(tmp_path):
     entry = manifest["agents"][0]
     assert entry["plugins"] == 0
     assert any("plugin settings skipped" in warning for warning in entry["warnings"])
+
+
+def test_select_agents_create_missing_only_on_zero_matches():
+    agents = [_agent("corso1")]
+    created = []
+
+    selected = cli.select_agents(
+        agents,
+        ["corso", "nuovo"],
+        include_all=False,
+        exclude=[],
+        create_missing=True,
+        created_out=created,
+    )
+
+    assert [agent.agent_id for agent in selected] == ["corso1", "nuovo"]
+    assert created == ["nuovo"]
+    assert selected[1].metadata == {}
+
+
+def test_select_agents_create_missing_never_creates_when_a_substring_matches():
+    agents = [_agent("corso1")]
+    created = []
+
+    selected = cli.select_agents(
+        agents,
+        ["corso"],
+        include_all=False,
+        exclude=[],
+        create_missing=True,
+        created_out=created,
+    )
+
+    assert [agent.agent_id for agent in selected] == ["corso1"]
+    assert created == []
+
+
+def test_select_agents_without_create_missing_still_raises():
+    with pytest.raises(cli.SelectionError):
+        cli.select_agents([_agent("corso1")], ["nuovo"], include_all=False, exclude=[])
+
+
+def test_all_with_create_missing_exits_2(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(
+            ["--all", "--create-missing", "--metadata", "label=qa"],
+            client_factory=_forbidden_factory,
+        )
+
+    assert excinfo.value.code == 2
+    assert "--create-missing" in capsys.readouterr().err
+
+
+def test_dump_with_create_missing_exits_2(tmp_path, capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(
+            ["--dump", str(tmp_path), "--all", "--create-missing"],
+            client_factory=_forbidden_factory,
+        )
+
+    assert excinfo.value.code == 2
+    assert "--create-missing" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [["--diff"], ["--dump-only", "llm"], ["--dump-secrets"], ["--dump-manifest-only"]],
+)
+def test_dump_modifiers_with_create_missing_exit_2(tmp_path, capsys, extra):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(
+            ["--dump", str(tmp_path), "--all", "--create-missing", *extra],
+            client_factory=_forbidden_factory,
+        )
+
+    assert excinfo.value.code == 2
+    assert "--create-missing" in capsys.readouterr().err
+
+
+def test_dry_run_plan_marks_a_missing_agent_for_creation(capsys):
+    client = FakeClient(agents=[_agent("corso1")])
+
+    rc = cli.main(
+        ["--agent", "nuovo", "--create-missing", "--metadata", "label=qa"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "agent=nuovo ops=create,metadata metadata_keys=label" in out
+    assert client.calls_to("post_agent_create") == []
+
+
+def test_dry_run_json_plan_marks_a_missing_agent_for_creation(capsys):
+    client = FakeClient(agents=[_agent("corso1")])
+
+    rc = cli.main(
+        ["--agent", "nuovo", "--create-missing", "--metadata", "label=qa", "--json"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["agents"] == [
+        {"agent": "nuovo", "ops": ["create", "metadata"], "metadata_keys": ["label"]}
+    ]
+
+
+def test_yes_creates_then_applies_operations(tmp_path, capsys):
+    client = FakeClient(agents=[_agent("corso1")])
+
+    rc = cli.main(
+        [
+            "--agent",
+            "nuovo",
+            "--create-missing",
+            "--metadata",
+            "label=qa",
+            "--yes",
+            "--backup-out",
+            str(tmp_path),
+            "--json",
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    entry = payload["agents"][0]
+    assert entry["created"] is True
+    assert entry["ok"] is True
+    assert client.calls_to("post_agent_create") == [("nuovo", {})]
+    assert client.calls_to("put_agent") == [("nuovo", {"label": "qa"})]
+    names = [name for name, _args in client.calls]
+    assert names.index("post_agent_create") < names.index("put_agent")
+    assert _snapshot_files(tmp_path) == []
+
+
+def test_created_false_fails_only_that_agent(capsys):
+    client = FakeClient(agents=[_agent("corso1")], create_false={"nuovo"})
+
+    rc = cli.main(
+        [
+            "--agent",
+            "nuovo",
+            "--agent",
+            "corso",
+            "--create-missing",
+            "--metadata",
+            "label=qa",
+            "--yes",
+            "--json",
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    by_id = {entry["agent_id"]: entry for entry in payload["agents"]}
+    assert by_id["nuovo"]["ok"] is False
+    assert by_id["nuovo"]["created"] is False
+    assert "created=false" in by_id["nuovo"]["error"]
+    assert by_id["corso1"]["ok"] is True
+    assert client.calls_to("put_agent") == [("corso1", {"label": "qa"})]
+
+
+def test_yes_does_not_create_when_the_substring_matches(tmp_path):
+    client = FakeClient(agents=[_agent("corso1")])
+
+    rc = cli.main(
+        [
+            "--agent",
+            "corso",
+            "--create-missing",
+            "--metadata",
+            "label=qa",
+            "--yes",
+            "--backup-out",
+            str(tmp_path),
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert client.calls_to("post_agent_create") == []
+
+
+def test_restore_create_missing_creates_then_restores(tmp_path, capsys):
+    client = FakeClient(agents=[_agent("corso1", {"public": True})])
+    first = cli.main(
+        ["--agent", "corso", "--name", "X", "--yes", "--backup-out", str(tmp_path)],
+        client_factory=lambda: client,
+    )
+    assert first == 0
+    capsys.readouterr()
+
+    gone = FakeClient(agents=[])
+    rc = cli.main(
+        ["--restore", str(tmp_path), "--create-missing", "--yes", "--json"],
+        client_factory=lambda: gone,
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["agents"][0]["created"] is True
+    assert gone.calls_to("post_agent_create") == [("corso1", {"public": True})]
+    assert gone.calls_to("put_agent") == [("corso1", {"public": True})]
+
+
+def test_restore_dry_run_marks_missing_agents_for_creation(tmp_path, capsys):
+    client = FakeClient(agents=[_agent("corso1", {"public": True})])
+    first = cli.main(
+        ["--agent", "corso", "--name", "X", "--yes", "--backup-out", str(tmp_path)],
+        client_factory=lambda: client,
+    )
+    assert first == 0
+    capsys.readouterr()
+
+    gone = FakeClient(agents=[])
+    rc = cli.main(
+        ["--restore", str(tmp_path), "--create-missing"],
+        client_factory=lambda: gone,
+    )
+
+    assert rc == 2
+    assert "agent=corso1 ops=create,restore" in capsys.readouterr().out
+    assert gone.calls_to("post_agent_create") == []

@@ -120,6 +120,7 @@ GRINNING_CAT_API_SECURE_CONNECTION=false
 | --- | --- |
 | `--agent SUBSTRING` | agent id or a case-insensitive substring of it (repeatable) |
 | `--all` | every agent except system and `__*` |
+| `--create-missing` | create an agent when `--agent` matches nothing (never with `--all`) |
 | `--exclude SUBSTRING` | drop agents whose id contains this substring, case-insensitive (repeatable) |
 | `--llm NAME=JSON` | merge a JSON object into the LLM configuration NAME from `GET /llm/settings` (repeatable) |
 | `--plugin NAME=on\|off` | enable or disable a plugin (repeatable) |
@@ -174,6 +175,7 @@ The file must contain exactly one YAML document (no `---` separators); YAML anch
 - Dry run by default. `--yes` is required to write anything.
 - Before writing, each agent gets a snapshot under `--backup-out` (default `./agent-backup-<UTC stamp>`).
 - `--restore <dir|file>` re-applies a snapshot and is itself a dry run unless you add `--yes`.
+- `--create-missing` is opt-in and never applies to `--all`: only an `--agent` substring that matches nothing becomes a new agent. A created agent has no before-state, so it is not snapshotted.
 - `--allow-system-wide` is required for `embedder` and `ingestion`, because those settings re-embed every agent.
 - `--max-workers > 1` runs one task per agent in parallel.
 
@@ -205,6 +207,17 @@ uv run python scripts/batch_agent_update.py \
   --yes \
   --backup-out ./backup
 ```
+
+Create an agent that does not exist yet, then configure it in the same run:
+
+```bash
+uv run python scripts/batch_agent_update.py \
+  --agent nuovo \
+  --create-missing \
+  --patch examples/patch-full-agent.yml
+```
+
+`--create-missing` only applies to `--agent` substrings that match nothing; a substring that matches at least one existing agent never creates. It cannot be combined with `--all` or the dump flags (`--dump`, `--diff`, `--dump-only`, `--dump-secrets`, `--dump-manifest-only`). With `--restore`, it creates the agents the snapshot reports as missing before restoring them.
 
 #### Patch file examples
 

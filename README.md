@@ -112,7 +112,7 @@ GRINNING_CAT_API_KEY=your-api-key
 GRINNING_CAT_API_SECURE_CONNECTION=false
 ```
 
-`GRINNING_CAT_API_KEY` is required; the other three fall back to `localhost`, `1865` and `false`. The key must carry the permissions for every resource the run touches: CHESHIRE_CAT (read and write), LLM, PLUGIN, CHUNKER, VECTOR_DATABASE, AUTH_HANDLER, AGENTIC_WORKFLOW, CONTEXT_RETRIEVER and FILE_MANAGER. Note that the core gates the single-setting chunker GET/PUT on AUTH_HANDLER, so a run that patches `chunking` needs that permission too. Add SYSTEM when you use `--allow-system-wide`.
+`GRINNING_CAT_API_KEY` is required; the other three fall back to `localhost`, `1865` and `false`. The key must carry the permissions for every resource the run touches: CHESHIRE_CAT (read and write), LLM, PLUGIN, CHUNKER, VECTOR_DATABASE, AUTH_HANDLER, AGENTIC_WORKFLOW, CONTEXT_RETRIEVER and FILE_MANAGER. Note that the core gates the single-setting chunker GET/PUT on AUTH_HANDLER, so a run that patches `chunking` needs that permission too. `--allow-system-wide` patches the single-setting embedder GET/PUT, which the core gates on EMBEDDER (`check_permissions(AuthResource.EMBEDDER, AuthPermission.READ)` / `...WRITE` in `cat/routes/embedder.py`); add SYSTEM only when the run also touches system endpoints.
 
 ### Flags
 

@@ -9,10 +9,15 @@ operation failed, 2 = dry-run, abort or usage error.
 """
 
 import argparse
+import contextlib
+import hashlib
 import json
+import os
 import re
 import sys
+import tempfile
 import threading
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -80,32 +85,6 @@ def render_plan(
     ops_label = ",".join(ops)
     keys_label = ",".join(metadata_keys or [])
     return [f"agent={agent.agent_id} ops={ops_label} metadata_keys={keys_label}" for agent in selected]
-
-
-def _operations(args: argparse.Namespace) -> list[str]:
-    ops = []
-    if args.llm:
-        ops.append("llm")
-    if args.plugin:
-        ops.append("plugin")
-    if args.metadata or args.name:
-        ops.append("metadata")
-    if args.set:
-        ops.append("set")
-    if args.patch:
-        ops.append("patch")
-    return ops
-
-
-def _metadata_keys(args: argparse.Namespace) -> list[str]:
-    keys = []
-    for item in args.metadata or []:
-        key = item.split("=", 1)[0].strip()
-        if key:
-            keys.append(key)
-    if args.name:
-        keys.append("name")
-    return keys
 
 
 def _configuration() -> Configuration | None:
@@ -178,7 +157,7 @@ def merge_factory_setting(
     base: dict[str, Any] = (
         getattr(endpoint, getter_name)(name, agent_id).value if current is None else current
     )
-    merged = {**base, **patch}
+    merged = _deep_merge(base, patch)
     getattr(endpoint, putter_name)(name, agent_id, merged)
     return merged
 
@@ -385,7 +364,7 @@ def update_metadata(
     caller supply a value it has already read.
     """
     base = dict(agent.metadata) if current is None else current
-    merged = {**base, **updates}
+    merged = _deep_merge(base, updates)
     result = client.utils.put_agent(agent.agent_id, merged)
     if not result.updated:
         raise RuntimeError(f"updated=false for {agent.agent_id}")
@@ -464,11 +443,11 @@ def _apply_system_wide(client: Any, operation: Operation) -> str:
     """Read-merge-write one system-scoped factory setting (embedder/ingestion)."""
     if operation.category == "embedder":
         current = client.embedder.get_embedder_settings(operation.name).value
-        client.embedder.put_embedder_settings(operation.name, {**current, **operation.payload})
+        client.embedder.put_embedder_settings(operation.name, _deep_merge(current, operation.payload))
         return "merged"
     if operation.category == "ingestion":
         current = client.ingestion.get_ingestion_settings(operation.name).value
-        client.ingestion.put_ingestion_settings(operation.name, {**current, **operation.payload})
+        client.ingestion.put_ingestion_settings(operation.name, _deep_merge(current, operation.payload))
         return "merged"
     raise NotImplementedError(f"system-wide category {operation.category!r} is not implemented yet")
 
@@ -544,16 +523,49 @@ def _build_snapshot(
 
 _SNAPSHOT_LOCK = threading.Lock()
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    fcntl = None
+
+
+@contextlib.contextmanager
+def _exclusive_lock(path: Path) -> Iterator[None]:
+    """Exclusive OS-level lock on ``path``; a no-op where ``fcntl`` is missing."""
+    if fcntl is None:  # pragma: no cover - non-POSIX platforms
+        yield
+        return
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Write ``payload`` to ``path`` through a same-directory temporary file."""
+    descriptor, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2))
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+
 
 def _write_snapshot(directory: Path, snapshot: dict[str, Any], argv: list[str]) -> None:
-    """Write one agent snapshot and update the shared manifest atomically enough."""
+    """Write one agent snapshot atomically and update the shared manifest."""
     directory.mkdir(parents=True, exist_ok=True)
     agent_id = snapshot["agent_id"]
-    filename = re.sub(r"[^A-Za-z0-9_.-]", "_", agent_id) + ".json"
-    (directory / filename).write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", agent_id)
+    filename = f"{safe_id}-{hashlib.sha1(agent_id.encode()).hexdigest()[:8]}.json"
+    _atomic_write_json(directory / filename, snapshot)
 
-    with _SNAPSHOT_LOCK:
-        manifest_path = directory / "manifest.json"
+    manifest_path = directory / "manifest.json"
+    with _SNAPSHOT_LOCK, _exclusive_lock(directory / ".manifest.lock"):
         manifest: dict[str, Any]
         if manifest_path.exists():
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -561,7 +573,7 @@ def _write_snapshot(directory: Path, snapshot: dict[str, Any], argv: list[str]) 
             manifest = {"created_at": _utc_now(), "argv": list(argv), "agents": []}
         if agent_id not in manifest["agents"]:
             manifest["agents"].append(agent_id)
-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        _atomic_write_json(manifest_path, manifest)
 
 
 def _run_agent(
@@ -704,11 +716,16 @@ def _load_snapshots(path: str) -> list[dict[str, Any]]:
     """Load every snapshot in a file or directory, skipping the manifest."""
     target = Path(path)
     if target.is_dir():
-        files = sorted(item for item in target.glob("*.json") if item.name != "manifest.json")
+        files = sorted(
+            item
+            for item in target.glob("*.json")
+            if item.name != "manifest.json" and not item.name.startswith(".")
+        )
     else:
         files = [target]
 
     snapshots = []
+    seen: set[str] = set()
     for file in files:
         try:
             data = json.loads(file.read_text(encoding="utf-8"))
@@ -716,6 +733,14 @@ def _load_snapshots(path: str) -> list[dict[str, Any]]:
             raise ValueError(f"cannot read snapshot {str(file)!r}: {exc}") from None
         if not isinstance(data, dict) or "agent_id" not in data:
             raise ValueError(f"invalid snapshot {str(file)!r}: missing agent_id")
+        agent_id = data["agent_id"]
+        if agent_id in seen:
+            print(
+                f"duplicate snapshot for agent {agent_id!r} in {str(file)!r}: keeping the first",
+                file=sys.stderr,
+            )
+            continue
+        seen.add(agent_id)
         snapshots.append(data)
     if not snapshots:
         raise ValueError(f"no snapshots found in {path!r}")
@@ -895,6 +920,9 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
 
     snapshots = None
     system_wide: list[Operation] = []
+    built_operations: list[Operation] | None = None
+    plan_ops: list[str] = ["restore"]
+    plan_metadata_keys: list[str] = []
     if args.restore:
         try:
             snapshots = _load_snapshots(args.restore)
@@ -903,9 +931,10 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
         operations: list[Operation] | dict[str, list[Operation]] = {}
     else:
         try:
-            operations, system_wide = _build_operations(args)
+            built_operations, system_wide = _build_operations(args)
         except ValueError as exc:
             parser.error(str(exc))
+        operations = built_operations
 
     client = client_factory()
     if client is None:
@@ -913,7 +942,7 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
 
     try:
         agents = client.utils.get_agents()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - CLI boundary: report the discovery failure instead of a traceback
         print(f"cannot list agents: {exc}", file=sys.stderr)
         return 1
 
@@ -932,27 +961,41 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
                 AgentOutput(agent_id=agent_id, metadata=dict(snapshot.get("metadata", {})))
             )
         operations = per_agent
-        ops = ["restore"]
-        metadata_keys: list[str] = []
     else:
         try:
             selected = select_agents(agents, args.agent or [], args.all, args.exclude or [])
         except SelectionError as exc:
             print(str(exc), file=sys.stderr)
             return 2
-        ops = _operations(args)
-        metadata_keys = _metadata_keys(args)
+        plan_ops = [_operation_label(operation) for operation in built_operations or []]
+        plan_metadata_keys = sorted(
+            key
+            for operation in built_operations or []
+            if operation.kind == "metadata"
+            for key in operation.payload
+        )
 
     if not args.yes:
         if args.json:
             print(
                 json.dumps(
-                    [{"agent": agent.agent_id, "ops": ops, "metadata_keys": metadata_keys} for agent in selected],
+                    {
+                        "dry_run": True,
+                        "agents": [
+                            {
+                                "agent": agent.agent_id,
+                                "ops": plan_ops,
+                                "metadata_keys": plan_metadata_keys,
+                            }
+                            for agent in selected
+                        ],
+                        "system_wide": [{"op": _operation_label(operation)} for operation in system_wide],
+                    },
                     indent=2,
                 )
             )
         else:
-            for line in render_plan(selected, ops, metadata_keys):
+            for line in render_plan(selected, plan_ops, plan_metadata_keys):
                 print(line)
             print(f"system-wide: {len(system_wide)}")
         print("dry-run: no changes written (pass --yes to apply)", file=sys.stderr)

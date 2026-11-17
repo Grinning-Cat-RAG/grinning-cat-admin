@@ -3,6 +3,7 @@
 The CLI is always exercised through ``main(argv, client_factory=...)`` with a
 fake client: no test opens a socket, touches Redis or needs a running Cat.
 """
+import hashlib
 import importlib.util
 import json
 import sys
@@ -261,6 +262,15 @@ def _agent(agent_id, metadata=None):
     return AgentOutput(agent_id=agent_id, metadata=metadata or {})
 
 
+def _snapshot_files(directory):
+    """Every snapshot file in ``directory``, excluding the manifest and dotfiles."""
+    return sorted(
+        path
+        for path in Path(directory).glob("*.json")
+        if path.name != "manifest.json" and not path.name.startswith(".")
+    )
+
+
 def test_select_agents_matches_case_insensitive_substrings():
     agents = [_agent("Prod_Corso1"), _agent("prod_corso2"), _agent("other")]
 
@@ -331,7 +341,7 @@ def test_dry_run_prints_the_plan_and_writes_nothing(capsys):
 
     assert rc == 2
     out = capsys.readouterr().out
-    assert "agent=Corso1 ops=llm metadata_keys=" in out
+    assert "agent=Corso1 ops=llm:gpt-4 metadata_keys=" in out
     assert client.calls_to("put_large_language_model_settings") == []
     assert client.calls_to("put_agent") == []
 
@@ -352,7 +362,11 @@ def test_dry_run_json_plan(capsys):
 
     assert rc == 2
     payload = json.loads(capsys.readouterr().out)
-    assert payload == [{"agent": "Corso1", "ops": ["llm"], "metadata_keys": []}]
+    assert payload == {
+        "dry_run": True,
+        "agents": [{"agent": "Corso1", "ops": ["llm:gpt-4"], "metadata_keys": []}],
+        "system_wide": [],
+    }
 
 
 def test_discovery_failure_exits_1(capsys):
@@ -972,8 +986,25 @@ def test_dry_run_json_stays_an_array_with_system_wide(capsys):
 
     assert rc == 2
     payload = json.loads(capsys.readouterr().out)
-    assert isinstance(payload, list)
-    assert payload == [{"agent": "corso1", "ops": ["set"], "metadata_keys": []}]
+    assert payload == {
+        "dry_run": True,
+        "agents": [{"agent": "corso1", "ops": [], "metadata_keys": []}],
+        "system_wide": [{"op": "system:embedder:openai"}],
+    }
+
+
+def test_dry_run_plan_derives_metadata_keys_from_the_operations(capsys):
+    client = FakeClient(agents=[_agent("corso1")])
+
+    rc = cli.main(
+        ["--agent", "corso", "--set", "metadata:ignored:name=x", "--json"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["agents"] == [{"agent": "corso1", "ops": ["metadata"], "metadata_keys": ["name"]}]
+    assert payload["system_wide"] == []
 
 
 def test_backup_out_writes_one_snapshot_per_agent_and_a_manifest(tmp_path):
@@ -985,17 +1016,16 @@ def test_backup_out_writes_one_snapshot_per_agent_and_a_manifest(tmp_path):
     )
 
     assert rc == 0
-    assert sorted(path.name for path in tmp_path.glob("*.json")) == [
-        "corso1.json",
-        "corso2.json",
-        "manifest.json",
-    ]
+    snapshot_files = _snapshot_files(tmp_path)
+    assert len(snapshot_files) == 2
     manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["agents"] == ["corso1", "corso2"]
     assert manifest["argv"]
     assert manifest["created_at"]
-    snapshot = json.loads((tmp_path / "corso1.json").read_text(encoding="utf-8"))
-    assert snapshot["metadata"] == {"public": True}
+    snapshots = [json.loads(path.read_text(encoding="utf-8")) for path in snapshot_files]
+    by_id = {snapshot["agent_id"]: snapshot for snapshot in snapshots}
+    assert by_id["corso1"]["metadata"] == {"public": True}
+    assert by_id["corso2"]["metadata"] == {}
 
 
 def test_snapshot_round_trip_restores_the_original_metadata(tmp_path):
@@ -1234,7 +1264,9 @@ def test_snapshot_contains_metadata_llm_plugins_and_categories(tmp_path):
     )
 
     assert rc == 0
-    snapshot = json.loads((tmp_path / "corso1.json").read_text(encoding="utf-8"))
+    files = _snapshot_files(tmp_path)
+    assert len(files) == 1
+    snapshot = json.loads(files[0].read_text(encoding="utf-8"))
     assert snapshot["metadata"] == {"public": True}
     assert snapshot["llm"] == {"gpt-4": {"model": "gpt-4", "temperature": 0.0}}
     assert snapshot["plugins"] == {"foo": {"active": True, "settings": {"k": "v"}}}
@@ -1296,3 +1328,136 @@ def test_restore_of_a_missing_agent_fails_without_writes(tmp_path, capsys):
     assert payload["agents"][0]["error"] == "agent not found on the server"
     assert payload["summary"]["failed"] == 1
     assert [name for name, _args in gone.calls if name.startswith("put_")] == []
+
+
+def test_set_nested_patch_keeps_nested_siblings():
+    client = FakeClient(
+        agents=[_agent("corso1")],
+        settings={("large_language_model", "gpt-4"): {"model": "gpt-4", "options": {"a": 1, "b": 2}}},
+    )
+
+    rc = cli.main(
+        ["--agent", "corso", "--set", "llm:gpt-4:options.a=9", "--yes"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert client.calls_to("put_large_language_model_settings") == [
+        ("gpt-4", "corso1", {"model": "gpt-4", "options": {"a": 9, "b": 2}})
+    ]
+
+
+def test_llm_patch_merges_nested_objects():
+    client = FakeClient(
+        agents=[_agent("corso1")],
+        settings={("large_language_model", "gpt-4"): {"model": "gpt-4", "options": {"a": 1, "b": 2}}},
+    )
+
+    rc = cli.main(
+        ["--agent", "corso", "--llm", 'gpt-4={"options": {"a": 7}}', "--yes"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert client.calls_to("put_large_language_model_settings") == [
+        ("gpt-4", "corso1", {"model": "gpt-4", "options": {"a": 7, "b": 2}})
+    ]
+
+
+def test_update_metadata_deep_merges_and_keeps_siblings():
+    client = FakeClient()
+    agent = _agent("corso1", {"opts": {"x": 1, "y": 2}})
+
+    merged = cli.update_metadata(client, agent, {"opts": {"x": 5}})
+
+    assert merged == {"opts": {"x": 5, "y": 2}}
+    assert client.calls_to("put_agent") == [("corso1", {"opts": {"x": 5, "y": 2}})]
+
+
+def test_system_wide_merge_keeps_nested_siblings():
+    client = FakeClient(
+        agents=[_agent("corso1")],
+        settings={("embedder", "default"): {"model": "m", "options": {"a": 1, "b": 2}}},
+    )
+
+    rc = cli.main(
+        ["--agent", "corso", "--set", "embedder:default:options.a=9", "--allow-system-wide", "--yes"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert client.calls_to("put_embedder_settings") == [
+        ("default", {"model": "m", "options": {"a": 9, "b": 2}})
+    ]
+
+
+def test_snapshot_filenames_do_not_collide(tmp_path):
+    client = FakeClient(
+        agents=[_agent("a/b", {"which": "slash"}), _agent("a_b", {"which": "underscore"})]
+    )
+
+    rc = cli.main(
+        ["--agent", "a", "--metadata", "label=x", "--yes", "--backup-out", str(tmp_path)],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    files = _snapshot_files(tmp_path)
+    expected = sorted(
+        [
+            f"a_b-{hashlib.sha1(b'a/b').hexdigest()[:8]}.json",
+            f"a_b-{hashlib.sha1(b'a_b').hexdigest()[:8]}.json",
+        ]
+    )
+    assert [path.name for path in files] == expected
+    by_id = {json.loads(path.read_text(encoding="utf-8"))["agent_id"]: path for path in files}
+    assert set(by_id) == {"a/b", "a_b"}
+    assert json.loads(by_id["a/b"].read_text(encoding="utf-8"))["metadata"] == {"which": "slash"}
+    assert json.loads(by_id["a_b"].read_text(encoding="utf-8"))["metadata"] == {"which": "underscore"}
+
+
+def test_manifest_stays_valid_with_parallel_writers(tmp_path):
+    agents = [_agent(f"corso{index}") for index in range(8)]
+    client = FakeClient(agents=agents)
+
+    rc = cli.main(
+        [
+            "--all",
+            "--metadata",
+            "label=b",
+            "--yes",
+            "--backup-out",
+            str(tmp_path),
+            "--max-workers",
+            "4",
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert sorted(manifest["agents"]) == [f"corso{index}" for index in range(8)]
+    assert len(cli._load_snapshots(str(tmp_path))) == 8
+
+
+def test_duplicate_snapshots_are_applied_once(tmp_path, capsys):
+    client = FakeClient(agents=[_agent("corso1")], plugins={"corso1": {"foo": False}})
+    snapshot = {
+        "agent_id": "corso1",
+        "metadata": {},
+        "llm": {},
+        "plugins": {"foo": {"active": True, "settings": {}}},
+        "categories": {},
+    }
+    (tmp_path / "a.json").write_text(json.dumps(snapshot), encoding="utf-8")
+    (tmp_path / "b.json").write_text(json.dumps(snapshot), encoding="utf-8")
+
+    rc = cli.main(["--restore", str(tmp_path), "--yes", "--json"], client_factory=lambda: client)
+
+    assert rc == 0
+    assert client.calls_to("put_toggle_plugin") == [("foo", "corso1")]
+    assert client.plugin_states["corso1"]["foo"] is True
+    assert len(client.calls_to("put_agent")) == 1
+    err = capsys.readouterr().err
+    assert "duplicate" in err
+    assert "corso1" in err

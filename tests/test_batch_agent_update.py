@@ -153,6 +153,7 @@ class FakeClient:
         toggle_noop=False,
         plugin_settings=None,
         concurrency_guard=False,
+        disappearing_plugins=None,
     ):
         self.calls = []
         self.agents = list(agents or [])
@@ -166,6 +167,7 @@ class FakeClient:
         }
         self.toggle_noop = toggle_noop
         self.concurrency_guard = concurrency_guard
+        self.disappearing_plugins = set(disappearing_plugins or ())
         self._agent_locks = {}
         self._agent_ids = {agent.agent_id for agent in self.agents}
         for attribute in (
@@ -201,6 +203,9 @@ class FakeClient:
         self.calls.append((method_name, args))
         if method_name in self.fail_on:
             raise RuntimeError(f"{method_name} failed")
+        agent_id = next((value for value in args if isinstance(value, str) and value in self._agent_ids), None)
+        if agent_id is not None and (method_name, agent_id) in self.fail_on:
+            raise RuntimeError(f"{method_name} failed for {agent_id}")
         if method_name == "get_agents":
             return list(self.agents)
         if method_name == "put_agent":
@@ -221,6 +226,8 @@ class FakeClient:
                 raise RuntimeError(f"plugin {plugin_id!r} is not installed for agent {agent_id!r}")
             if not self.toggle_noop:
                 state[plugin_id] = not state[plugin_id]
+            if plugin_id in self.disappearing_plugins:
+                state.pop(plugin_id, None)
             return PluginToggleOutput(info="toggled")
         if method_name == "get_plugin_settings":
             plugin_id, agent_id = args
@@ -1094,3 +1101,198 @@ def test_ingestion_system_wide_merges_once(capsys):
     assert client.calls_to("put_ingestion_settings") == [("default", {"engine": "core", "batch_size": 8})]
     payload = json.loads(capsys.readouterr().out)
     assert payload["system_wide"] == [{"op": "system:ingestion:default", "status": "ok", "detail": "merged"}]
+
+
+def test_llm_get_failure_fails_only_that_agent(capsys):
+    client = FakeClient(
+        agents=[_agent("corso1"), _agent("corso2")],
+        settings={("large_language_model", "gpt-4"): {"model": "gpt-4", "temperature": 0.0}},
+        fail_on={("get_large_language_model_settings", "corso1")},
+    )
+
+    rc = cli.main(
+        ["--agent", "corso", "--llm", 'gpt-4={"temperature": 0.2}', "--yes", "--json"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    by_id = {result["agent_id"]: result for result in payload["agents"]}
+    assert by_id["corso1"]["ok"] is False
+    assert by_id["corso2"]["ok"] is True
+    assert client.calls_to("put_large_language_model_settings") == [
+        ("gpt-4", "corso2", {"model": "gpt-4", "temperature": 0.2})
+    ]
+
+
+def test_plugin_disappearing_after_toggle_fails_the_agent(capsys):
+    client = FakeClient(
+        agents=[_agent("corso1")],
+        plugins={"corso1": {"foo": False}},
+        disappearing_plugins={"foo"},
+    )
+
+    rc = cli.main(["--agent", "corso", "--plugin", "foo=on", "--yes"], client_factory=lambda: client)
+
+    assert rc == 1
+    assert client.calls_to("put_toggle_plugin") == [("foo", "corso1")]
+    assert "disappeared" in capsys.readouterr().out
+
+
+def test_restore_writes_back_llm_and_chunking_values(tmp_path):
+    client = FakeClient(
+        agents=[_agent("corso1")],
+        settings={
+            ("large_language_model", "gpt-4"): {"model": "gpt-4", "temperature": 0.0},
+            ("chunker", "default"): {"chunk_size": 256, "chunk_overlap": 32},
+        },
+    )
+
+    first = cli.main(
+        [
+            "--agent",
+            "corso",
+            "--llm",
+            'gpt-4={"temperature": 0.2}',
+            "--set",
+            "chunking:default:chunk_size=512",
+            "--yes",
+            "--backup-out",
+            str(tmp_path),
+        ],
+        client_factory=lambda: client,
+    )
+    assert first == 0
+    assert client.settings[("large_language_model", "gpt-4")] == {"model": "gpt-4", "temperature": 0.2}
+    assert client.settings[("chunker", "default")] == {"chunk_size": 512, "chunk_overlap": 32}
+
+    client.settings[("large_language_model", "gpt-4")] = {"model": "gpt-4", "temperature": 0.9}
+    client.settings[("chunker", "default")] = {"chunk_size": 1024, "chunk_overlap": 32}
+    client.calls.clear()
+
+    second = cli.main(["--restore", str(tmp_path), "--yes"], client_factory=lambda: client)
+
+    assert second == 0
+    assert client.calls_to("put_large_language_model_settings") == [
+        ("gpt-4", "corso1", {"model": "gpt-4", "temperature": 0.0})
+    ]
+    assert client.calls_to("put_chunker_settings") == [
+        ("default", "corso1", {"chunk_size": 256, "chunk_overlap": 32})
+    ]
+
+
+def test_restore_reconciles_plugin_active_state_and_settings(tmp_path):
+    client = FakeClient(
+        agents=[_agent("corso1")],
+        plugins={"corso1": {"foo": True}},
+        plugin_settings={("corso1", "foo"): {"k": "v"}},
+    )
+
+    first = cli.main(
+        ["--agent", "corso", "--plugin", "foo=off", "--yes", "--backup-out", str(tmp_path)],
+        client_factory=lambda: client,
+    )
+    assert first == 0
+    assert client.plugin_states["corso1"]["foo"] is False
+
+    client.calls.clear()
+    second = cli.main(["--restore", str(tmp_path), "--yes"], client_factory=lambda: client)
+
+    assert second == 0
+    assert client.plugin_states["corso1"]["foo"] is True
+    assert client.calls_to("put_plugin_settings") == [("foo", "corso1", {"k": "v"})]
+
+
+def test_snapshot_contains_metadata_llm_plugins_and_categories(tmp_path):
+    client = FakeClient(
+        agents=[_agent("corso1", {"public": True})],
+        settings={
+            ("large_language_model", "gpt-4"): {"model": "gpt-4", "temperature": 0.0},
+            ("chunker", "default"): {"chunk_size": 256},
+        },
+        plugins={"corso1": {"foo": True}},
+        plugin_settings={("corso1", "foo"): {"k": "v"}},
+    )
+
+    rc = cli.main(
+        [
+            "--agent",
+            "corso",
+            "--metadata",
+            "label=b",
+            "--llm",
+            'gpt-4={"temperature": 0.2}',
+            "--plugin",
+            "foo=off",
+            "--set",
+            "chunking:default:chunk_size=512",
+            "--yes",
+            "--backup-out",
+            str(tmp_path),
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    snapshot = json.loads((tmp_path / "corso1.json").read_text(encoding="utf-8"))
+    assert snapshot["metadata"] == {"public": True}
+    assert snapshot["llm"] == {"gpt-4": {"model": "gpt-4", "temperature": 0.0}}
+    assert snapshot["plugins"] == {"foo": {"active": True, "settings": {"k": "v"}}}
+    assert snapshot["categories"] == {"chunking": {"default": {"chunk_size": 256}}}
+
+
+def test_json_report_for_a_failed_agent_carries_the_detail(capsys):
+    client = FakeClient(agents=[_agent("corso1")], updated_false={"corso1"})
+
+    rc = cli.main(
+        ["--agent", "corso", "--metadata", "label=b", "--yes", "--json"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["agents"][0]["ok"] is False
+    failed = [operation for operation in payload["agents"][0]["ops"] if operation["status"] == "failed"]
+    assert len(failed) == 1
+    assert failed[0]["detail"] == "updated=false for corso1"
+    assert payload["summary"]["failed"] == 1
+
+
+def test_all_with_exclude_writes_only_the_remaining_agents():
+    client = FakeClient(
+        agents=[
+            _agent("system"),
+            _agent("__internal"),
+            _agent("corso1"),
+            _agent("corso2_test"),
+            _agent("other"),
+        ]
+    )
+
+    rc = cli.main(
+        ["--all", "--exclude", "test", "--metadata", "label=b", "--yes"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert sorted(args[0] for args in client.calls_to("put_agent")) == ["corso1", "other"]
+
+
+def test_restore_of_a_missing_agent_fails_without_writes(tmp_path, capsys):
+    client = FakeClient(agents=[_agent("corso1", {"public": True})])
+    first = cli.main(
+        ["--agent", "corso", "--name", "X", "--yes", "--backup-out", str(tmp_path)],
+        client_factory=lambda: client,
+    )
+    assert first == 0
+    capsys.readouterr()
+
+    gone = FakeClient(agents=[])
+    rc = cli.main(["--restore", str(tmp_path), "--yes", "--json"], client_factory=lambda: gone)
+
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["agents"][0]["ok"] is False
+    assert payload["agents"][0]["error"] == "agent not found on the server"
+    assert payload["summary"]["failed"] == 1
+    assert [name for name, _args in gone.calls if name.startswith("put_")] == []

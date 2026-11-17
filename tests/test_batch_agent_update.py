@@ -2805,3 +2805,84 @@ def test_dump_manifest_only_is_exclusive_with_diff(tmp_path, capsys):
 
     assert excinfo.value.code == 2
     assert "--diff" in capsys.readouterr().err
+
+
+# --- Todo 10: dump/diff/manifest coverage ----------------------------------
+
+
+def test_dump_round_trip_through_patch_dry_run(tmp_path, capsys):
+    agents = [_agent("corso")]
+    client = FakeClient(
+        agents=agents,
+        factory_lists=_full_factory_lists("corso"),
+        plugins={"corso": {"foo": True}},
+    )
+    assert _dump_once(tmp_path, client) == 0
+    path = tmp_path / cli._dump_filename("corso")
+    capsys.readouterr()
+
+    rc = cli.main(["--agent", "corso", "--patch", str(path)], client_factory=lambda: client)
+
+    assert rc == 2
+    assert [name for name, _args in client.calls if name.startswith("put_")] == []
+
+
+def test_dump_only_plugins_and_active_plugins(tmp_path):
+    agents = [_agent("corso")]
+    client = FakeClient(
+        agents=agents,
+        plugins={"corso": {"foo": True}},
+        plugin_settings={("corso", "foo"): {"opt": 1}},
+    )
+
+    rc = cli.main(
+        [
+            "--dump",
+            str(tmp_path),
+            "--all",
+            "--dump-only",
+            "plugins",
+            "--dump-only",
+            "active_plugins",
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    payload = _dump_body(tmp_path / cli._dump_filename("corso"))
+    assert set(payload) == {"plugins", "active_plugins"}
+    assert payload["plugins"] == {"foo": {"opt": 1}}
+    assert payload["active_plugins"] == {"foo": "on"}
+
+
+def test_dump_secrets_flag_keeps_secrets_in_the_file(tmp_path):
+    agents = [_agent("corso")]
+    client = FakeClient(
+        agents=agents,
+        factory_lists={
+            ("large_language_model", "corso"): _factory_list(
+                "LLMOpenRouterConfig", {"LLMOpenRouterConfig": {"api_key": "sk-1"}}
+            )
+        },
+    )
+
+    rc = cli.main(
+        ["--dump", str(tmp_path), "--all", "--dump-only", "llm", "--dump-secrets"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    path = tmp_path / cli._dump_filename("corso")
+    assert _dump_body(path)["llm"]["LLMOpenRouterConfig"]["api_key"] == "sk-1"
+    assert "# secret-policy: included" in path.read_text(encoding="utf-8")
+
+
+def test_diff_does_not_write_a_manifest(tmp_path):
+    agents = [_agent("corso")]
+    client = FakeClient(agents=agents, factory_lists=_full_factory_lists("corso"))
+    assert _dump_once(tmp_path, client) == 0
+    manifest_before = (tmp_path / "manifest.yml").read_bytes()
+
+    cli.main(["--dump", str(tmp_path), "--all", "--diff"], client_factory=lambda: client)
+
+    assert (tmp_path / "manifest.yml").read_bytes() == manifest_before

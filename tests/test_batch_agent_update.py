@@ -2886,3 +2886,257 @@ def test_diff_does_not_write_a_manifest(tmp_path):
     cli.main(["--dump", str(tmp_path), "--all", "--diff"], client_factory=lambda: client)
 
     assert (tmp_path / "manifest.yml").read_bytes() == manifest_before
+
+
+# --- Todo 12: end-to-end round-trip and system-wide guard ------------------
+
+_ROUND_TRIP_AGENT_IDS = ("corso", "lab", "system", "__widget")
+
+
+def _round_trip_factory_lists(agent_id, api_key=None):
+    """Every category a dump reads, with a known ``temperature`` in the LLM."""
+    lists = _full_factory_lists(agent_id)
+    llm_value = {"model": "m", "temperature": 0.2}
+    if api_key is not None:
+        llm_value["api_key"] = api_key
+    lists[("large_language_model", agent_id)] = _factory_list(
+        "LLMOpenRouterConfig", {"LLMOpenRouterConfig": llm_value}
+    )
+    if agent_id == "system":
+        lists[("embedder", None)] = _factory_list(
+            "OpenAIEmbedder", {"OpenAIEmbedder": {"model": "e", "api_key": "sk-embed"}}
+        )
+        lists[("ingestion", None)] = _factory_list(
+            "Ingestion", {"Ingestion": {"batch": 10}}
+        )
+    return lists
+
+
+def _round_trip_client(agent_ids, api_key=None):
+    """A fake client holding a complete, dumpable configuration per agent."""
+    agents = [_agent(agent_id, metadata={"name": agent_id}) for agent_id in agent_ids]
+    lists = {}
+    for agent_id in agent_ids:
+        lists.update(_round_trip_factory_lists(agent_id, api_key=api_key))
+    return FakeClient(
+        agents=agents,
+        factory_lists=lists,
+        plugins={agent_id: {"foo": True} for agent_id in agent_ids},
+        plugin_settings={(agent_id, "foo"): {"enabled": True, "level": 2} for agent_id in agent_ids},
+    )
+
+
+def _manifest_entries(directory):
+    manifest = yaml.safe_load((Path(directory) / "manifest.yml").read_text(encoding="utf-8"))
+    return manifest["agents"]
+
+
+def _dump_body_text(path):
+    """The YAML body of a dump file, with the ``#`` metadata header removed."""
+    return "\n".join(
+        line for line in Path(path).read_text(encoding="utf-8").splitlines() if not line.startswith("#")
+    )
+
+
+def _tree_state(directory):
+    """Every entry under ``directory`` with its size, mtime and content hash."""
+    state = {}
+    for path in sorted(Path(directory).rglob("*")):
+        relative = path.relative_to(directory).as_posix()
+        stat = path.stat()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+        state[relative] = (stat.st_size, stat.st_mtime_ns, digest)
+    return state
+
+
+def _put_calls(client):
+    return [name for name, _args in client.calls if name.startswith("put_")]
+
+
+@pytest.mark.parametrize("agent_id", _ROUND_TRIP_AGENT_IDS)
+def test_dump_reload_is_a_dry_run_that_never_writes(agent_id, tmp_path, capsys, monkeypatch):
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    dump_dir = tmp_path / "dump"
+    client = _round_trip_client(_ROUND_TRIP_AGENT_IDS, api_key="sk-included")
+
+    assert (
+        cli.main(
+            ["--dump", str(dump_dir), "--all", "--dump-secrets"],
+            client_factory=lambda: client,
+        )
+        == 0
+    )
+    capsys.readouterr()
+    entry = next(item for item in _manifest_entries(dump_dir) if item["agent_id"] == agent_id)
+    patch_path = dump_dir / entry["file"]
+    assert patch_path.resolve().is_relative_to(dump_dir.resolve())
+
+    rc = cli.main(
+        ["--agent", agent_id, "--patch", str(patch_path), "--allow-system-wide"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert f"agent={agent_id} ops=" in captured.out
+    assert "metadata" in captured.out
+    assert "dry-run: no changes written" in captured.err
+    assert _put_calls(client) == []
+    assert list(work.iterdir()) == []
+
+
+def test_diff_after_dump_is_clean_and_leaves_the_directory_untouched(tmp_path, capsys, monkeypatch):
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    dump_dir = tmp_path / "dump"
+    client = _round_trip_client(_ROUND_TRIP_AGENT_IDS)
+    assert cli.main(["--dump", str(dump_dir), "--all"], client_factory=lambda: client) == 0
+    capsys.readouterr()
+    before = _tree_state(dump_dir)
+
+    rc = cli.main(["--dump", str(dump_dir), "--all", "--diff"], client_factory=lambda: client)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    for agent_id in _ROUND_TRIP_AGENT_IDS:
+        assert f"[diff] agent={agent_id} result=identical" in out
+    assert _tree_state(dump_dir) == before
+    assert _put_calls(client) == []
+    assert list(work.iterdir()) == []
+
+
+def test_diff_after_an_edit_reports_the_changed_key(tmp_path, capsys):
+    dump_dir = tmp_path / "dump"
+    client = _round_trip_client(["corso"])
+    assert cli.main(["--dump", str(dump_dir), "--all"], client_factory=lambda: client) == 0
+    path = dump_dir / cli._dump_filename("corso")
+    original = path.read_text(encoding="utf-8")
+    assert "temperature: 0.2" in original
+    path.write_text(original.replace("temperature: 0.2", "temperature: 0.9"), encoding="utf-8")
+    capsys.readouterr()
+
+    rc = cli.main(["--dump", str(dump_dir), "--all", "--diff"], client_factory=lambda: client)
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "[diff] agent=corso result=different" in out
+    assert "temperature" in out
+    # The dump side carries the edited value, the live side the original one.
+    assert "temperature: 0.9" in out
+    assert "temperature: 0.2" in out
+    assert _put_calls(client) == []
+
+
+def test_system_dump_contains_both_system_wide_categories(tmp_path):
+    dump_dir = tmp_path / "dump"
+    client = _round_trip_client(["system"])
+
+    assert (
+        cli.main(
+            ["--dump", str(dump_dir), "--all", "--dump-secrets"],
+            client_factory=lambda: client,
+        )
+        == 0
+    )
+
+    payload = _dump_body(dump_dir / cli._dump_filename("system"))
+    assert "embedder" in payload
+    assert "ingestion" in payload
+    assert _put_calls(client) == []
+
+
+def test_system_dump_reload_requires_allow_system_wide(tmp_path, capsys):
+    dump_dir = tmp_path / "dump"
+    client = _round_trip_client(["system"])
+    assert (
+        cli.main(
+            ["--dump", str(dump_dir), "--all", "--dump-secrets"],
+            client_factory=lambda: client,
+        )
+        == 0
+    )
+    path = dump_dir / cli._dump_filename("system")
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--agent", "system", "--patch", str(path)], client_factory=lambda: client)
+
+    assert excinfo.value.code == 2
+    assert "--allow-system-wide" in capsys.readouterr().err
+    assert _put_calls(client) == []
+
+
+def test_system_dump_reload_with_allow_system_wide_is_a_dry_run(tmp_path, capsys):
+    dump_dir = tmp_path / "dump"
+    client = _round_trip_client(["system"])
+    assert (
+        cli.main(
+            ["--dump", str(dump_dir), "--all", "--dump-secrets"],
+            client_factory=lambda: client,
+        )
+        == 0
+    )
+    path = dump_dir / cli._dump_filename("system")
+    capsys.readouterr()
+
+    rc = cli.main(
+        ["--agent", "system", "--patch", str(path), "--allow-system-wide"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert "agent=system ops=" in captured.out
+    # embedder and ingestion are applied once for the whole deployment, never
+    # per agent, so the plan reports them as system-wide operations.
+    assert "system-wide: 2" in captured.out
+    assert "dry-run: no changes written" in captured.err
+    assert _put_calls(client) == []
+
+
+def test_two_dumps_produce_identical_bodies(tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    client = _round_trip_client(_ROUND_TRIP_AGENT_IDS, api_key="sk-included")
+
+    assert (
+        cli.main(
+            ["--dump", str(first), "--all", "--dump-secrets"],
+            client_factory=lambda: client,
+        )
+        == 0
+    )
+    assert (
+        cli.main(
+            ["--dump", str(second), "--all", "--dump-secrets"],
+            client_factory=lambda: client,
+        )
+        == 0
+    )
+
+    names = sorted(path.name for path in first.glob("*.yml") if path.name != "manifest.yml")
+    assert names == sorted(path.name for path in second.glob("*.yml") if path.name != "manifest.yml")
+    assert names
+    for name in names:
+        assert _dump_body_text(first / name) == _dump_body_text(second / name)
+
+
+def test_default_dump_omits_secrets_and_counts_them(tmp_path):
+    dump_dir = tmp_path / "dump"
+    client = _round_trip_client(["corso"], api_key="sk-do-not-leak")
+
+    rc = cli.main(["--dump", str(dump_dir), "--all"], client_factory=lambda: client)
+
+    assert rc == 0
+    text = (dump_dir / cli._dump_filename("corso")).read_text(encoding="utf-8")
+    assert "api_key" not in text
+    assert "sk-do-not-leak" not in text
+    manifest = yaml.safe_load((dump_dir / "manifest.yml").read_text(encoding="utf-8"))
+    entry = manifest["agents"][0]
+    assert manifest["secret_policy"] == "omitted"
+    assert entry["omitted_secrets"] >= 1
+    assert "secrets omitted" in entry["warnings"][0]
+    assert _put_calls(client) == []

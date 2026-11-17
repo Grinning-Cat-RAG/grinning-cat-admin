@@ -12,6 +12,7 @@ from argparse import Namespace
 from pathlib import Path
 
 import pytest
+import yaml
 
 from grinning_cat_python_sdk.models.api.admins import AgentOutput, AgentUpdatedOutput
 from grinning_cat_python_sdk.models.api.factories import (
@@ -2247,3 +2248,87 @@ def test_dump_agent_config_keeps_secrets_when_requested():
     )
 
     assert payload["llm"]["LLMOpenRouterConfig"]["api_key"] == "sk-1"
+
+
+# --- Todo 4: YAML rendering with a metadata header and atomic 0600 write ---
+
+
+def test_dump_header_has_the_expected_lines_in_order():
+    header = cli._dump_header(
+        "corso",
+        "agent",
+        ["metadata", "llm"],
+        {"llm": "LLMOpenRouterConfig"},
+        ["--dump", "x"],
+        "host1",
+        "omitted",
+        [],
+    )
+
+    lines = header.splitlines()
+    assert lines[0] == "# dump-format: patch-v1"
+    assert lines[1].startswith("# generated-at: ")
+    assert lines[2] == "# generator: batch_agent_update.py --dump"
+    assert lines[3] == "# agent-id: corso"
+    assert lines[4] == "# agent-role: agent"
+    assert lines[5] == "# categories: metadata, llm"
+    assert lines[6] == "# selected: llm=LLMOpenRouterConfig"
+    assert lines[7] == '# argv: ["--dump", "x"]'
+    assert lines[8] == "# source-host: host1"
+    assert lines[9] == "# secret-policy: omitted"
+    assert lines[10] == "# warnings: none"
+
+
+def test_dump_header_lists_warnings():
+    header = cli._dump_header(
+        "system", "system", ["embedder"], {}, [], "h", "included", ["secrets omitted (2 fields)"]
+    )
+
+    assert "# warnings: secrets omitted (2 fields)" in header
+
+
+def test_render_dump_yaml_round_trips_the_payload():
+    payload = {"metadata": {"name": "Corso"}, "llm": {"LLMOpenRouterConfig": {"model": "m"}}}
+    header = cli._dump_header("corso", "agent", ["metadata", "llm"], {}, [], "h", "omitted", [])
+
+    text = cli._render_dump_yaml(payload, header)
+
+    assert text.startswith("# dump-format: patch-v1\n")
+    body = "\n".join(line for line in text.splitlines() if not line.startswith("#"))
+    assert yaml.safe_load(body) == payload
+
+
+def test_dump_file_is_accepted_by_load_patch(tmp_path):
+    payload = {"metadata": {"name": "Corso"}, "llm": {"LLMOpenRouterConfig": {"model": "m"}}}
+    header = cli._dump_header("corso", "agent", ["metadata", "llm"], {}, [], "h", "omitted", [])
+    path = tmp_path / cli._dump_filename("corso")
+
+    cli._atomic_write_text(path, cli._render_dump_yaml(payload, header))
+    patches, active_plugins = cli.load_patch(str(path))
+
+    assert patches[("metadata", "")] == {"name": "Corso"}
+    assert patches[("llm", "LLMOpenRouterConfig")] == {"model": "m"}
+    assert active_plugins == {}
+
+
+def test_atomic_write_text_sets_0600(tmp_path):
+    path = tmp_path / "x.yml"
+
+    cli._atomic_write_text(path, "hello\n")
+
+    assert path.read_text(encoding="utf-8") == "hello\n"
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_atomic_write_text_leaves_no_partial_file_on_failure(tmp_path):
+    missing = tmp_path / "missing"
+
+    with pytest.raises(OSError):
+        cli._atomic_write_text(missing / "x.yml", "x")
+
+    assert not missing.exists()
+
+
+def test_dump_filename_is_unique_for_colliding_safe_ids():
+    assert cli._dump_filename("a/b") != cli._dump_filename("a_b")
+    assert cli._dump_filename("corso").endswith(".yml")

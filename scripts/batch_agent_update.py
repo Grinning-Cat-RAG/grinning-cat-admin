@@ -767,6 +767,69 @@ def _write_snapshot(directory: Path, snapshot: dict[str, Any], argv: list[str]) 
         _atomic_write_json(manifest_path, manifest)
 
 
+def _dump_header(
+    agent: Any,
+    role: str,
+    categories: list[str],
+    selected: dict[str, str],
+    argv: list[str],
+    host: str,
+    secret_policy: str,
+    warnings: list[str],
+) -> str:
+    """Render the YAML comment block that documents one dump file."""
+    agent_id = getattr(agent, "agent_id", agent)
+    selected_label = ", ".join(f"{category}={name}" for category, name in selected.items())
+    warnings_label = ", ".join(warnings) if warnings else "none"
+    lines = [
+        "# dump-format: patch-v1",
+        f"# generated-at: {_utc_now()}",
+        "# generator: batch_agent_update.py --dump",
+        f"# agent-id: {agent_id}",
+        f"# agent-role: {role}",
+        f"# categories: {', '.join(categories)}",
+        f"# selected: {selected_label}",
+        f"# argv: {json.dumps(list(argv))}",
+        f"# source-host: {host}",
+        f"# secret-policy: {secret_policy}",
+        f"# warnings: {warnings_label}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _render_dump_yaml(payload: dict[str, Any], header: str) -> str:
+    """Prepend the metadata header to the YAML body of one dump file."""
+    body = yaml.safe_dump(
+        payload,
+        sort_keys=False,
+        default_flow_style=False,
+        allow_unicode=True,
+    )
+    return header + body
+
+
+def _atomic_write_text(path: Path, text: str, mode: int = 0o600) -> None:
+    """Write ``text`` to ``path`` atomically with ``mode`` (default ``0600``)."""
+    descriptor, temporary = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+
+
+def _dump_filename(agent_id: str) -> str:
+    """A filesystem-safe, collision-free ``.yml`` name for one agent dump."""
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", agent_id)
+    return f"{safe_id}-{hashlib.sha1(agent_id.encode()).hexdigest()[:8]}.yml"
+
+
 def _run_agent(
     client: Any,
     agent: AgentOutput,

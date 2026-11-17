@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.env import get_env, get_env_bool  # noqa: E402
 
+import yaml  # noqa: E402
 from grinning_cat_python_sdk import Configuration, GrinningCatClient  # noqa: E402
 from grinning_cat_python_sdk.models.api.admins import AgentOutput  # noqa: E402
 
@@ -260,98 +261,85 @@ def parse_set(items: list[str]) -> dict[tuple[str, str], dict[str, Any]]:
     return patches
 
 
-def _strip_jsonc(text: str) -> str:
-    """Strip JSONC comments and trailing commas, string-safely, in one pass.
+def _yaml_documents(text: str) -> list[Any]:
+    """Parse every YAML document in ``text`` with the non-typing ``BaseLoader``.
 
-    ``//`` and ``/* */`` comments are removed and a comma directly before a
-    closing ``}`` or ``]`` is dropped. Comment markers inside a JSON string are
-    data, and an escaped quote (``\\"``) does not end the string. Comments become
-    whitespace (newlines preserved), so a JSON error still points near the
-    original line.
+    ``BaseLoader`` keeps every scalar a string, so ``on``, ``0123``, ``1.10`` and
+    dates reach :func:`_parse_value` verbatim. Anchors and aliases are allowed:
+    the patch file is operator-trusted input, never untrusted user content.
     """
-    out: list[str] = []
-    index = 0
-    length = len(text)
-    in_string = False
-    while index < length:
-        char = text[index]
-        if in_string:
-            out.append(char)
-            if char == "\\" and index + 1 < length:
-                out.append(text[index + 1])
-                index += 2
-                continue
-            if char == '"':
-                in_string = False
-            index += 1
-            continue
-        if char == '"':
-            in_string = True
-            out.append(char)
-            index += 1
-            continue
-        if text.startswith("//", index):
-            index += 2
-            while index < length and text[index] not in "\r\n":
-                index += 1
-            continue
-        if text.startswith("/*", index):
-            out.append(" ")
-            index += 2
-            while index < length and not text.startswith("*/", index):
-                if text[index] in "\r\n":
-                    out.append(text[index])
-                index += 1
-            index += 2
-            continue
-        if char in "}]":
-            end = len(out)
-            while end and out[end - 1].isspace():
-                end -= 1
-            if end and out[end - 1] == ",":
-                del out[end - 1]
-        out.append(char)
-        index += 1
-    return "".join(out)
+    try:
+        documents = list(yaml.load_all(text, Loader=yaml.BaseLoader))
+    except yaml.YAMLError as exc:
+        raise ValueError(str(exc)) from None
+    if not documents:
+        raise ValueError("the file is empty")
+    if len(documents) > 1:
+        raise ValueError("the file contains multiple documents separated by ---")
+    return documents
+
+
+def _parse_leaves(node: Any) -> Any:
+    """Decode every scalar leaf with :func:`_parse_value`, keeping the shape."""
+    if isinstance(node, dict):
+        return {key: _parse_leaves(value) for key, value in node.items()}
+    if isinstance(node, list):
+        return [_parse_leaves(item) for item in node]
+    if isinstance(node, str):
+        return _parse_value(node)
+    return node
+
+
+def _legacy_comment_hint(text: str) -> str:
+    """Return a migration hint when the file still uses JSONC ``//`` comments."""
+    if any(line.lstrip().startswith("//") for line in text.splitlines()):
+        return " (looks like JSONC: use '#' for comments in YAML)"
+    return ""
 
 
 def load_patch(path: str) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, bool]]:
-    """Load a JSONC patch file into per-target patches and ``active_plugins``.
+    """Load a YAML patch file into per-target patches and ``active_plugins``.
 
-    The file is a ``{category: {name: patch}}`` object with one extra top-level
-    key, ``active_plugins``: ``{name: true|false}``. Comments and trailing
-    commas are allowed. Returns ``(patches, active_plugins)``.
+    The file is a ``{category: {name: patch}}`` mapping with one extra top-level
+    key, ``active_plugins``: ``{name: on|off}``. Plain JSON is valid YAML too.
+    Comments start with ``#``; anchors and aliases are allowed because the file
+    is operator-trusted. Returns ``(patches, active_plugins)``.
     """
     try:
         raw = Path(path).read_text(encoding="utf-8")
     except OSError as exc:
         raise ValueError(f"cannot read --patch {path!r}: {exc}") from None
     try:
-        data = json.loads(_strip_jsonc(raw))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid JSON in --patch {path!r}: {exc}") from None
+        documents = _yaml_documents(raw)
+    except ValueError as exc:
+        raise ValueError(f"invalid --patch {path!r}: {exc}{_legacy_comment_hint(raw)}") from None
+
+    data = documents[0]
     if not isinstance(data, dict):
-        raise ValueError(f"invalid --patch {path!r}: the top level must be a JSON object")
+        raise ValueError(f"invalid --patch {path!r}: the top level must be a mapping")
 
     patches: dict[tuple[str, str], dict[str, Any]] = {}
     active_plugins: dict[str, bool] = {}
     for category, entries in data.items():
         if not isinstance(entries, dict):
-            raise ValueError(f"invalid --patch {path!r}: category {category!r} must be an object")
+            raise ValueError(f"invalid --patch {path!r}: category {category!r} must be a mapping")
         if category == "active_plugins":
-            for name, desired in entries.items():
-                if not isinstance(desired, bool):
+            for name, state in entries.items():
+                normalized = state.strip().lower() if isinstance(state, str) else ""
+                if normalized not in _PLUGIN_STATES:
                     raise ValueError(
-                        f"invalid --patch {path!r}: active_plugins:{name} must be a boolean (true or false)"
+                        f"invalid --patch {path!r}: active_plugins:{name} must be on|off "
+                        f"(true/false/1/0 also accepted), got {state!r}"
                     )
-                active_plugins[name] = desired
+                active_plugins[name] = _PLUGIN_STATES[normalized]
             continue
+        converted = _parse_leaves(entries)
         if category == "metadata":
-            patches[("metadata", "")] = dict(entries)
+            patches[("metadata", "")] = converted
             continue
-        for name, patch in entries.items():
+        for name, patch in converted.items():
             if not isinstance(patch, dict):
-                raise ValueError(f"invalid --patch {path!r}: {category}:{name} must be an object")
+                raise ValueError(f"invalid --patch {path!r}: {category}:{name} must be a mapping")
             patches[(category, name)] = patch
     return patches, active_plugins
 
@@ -884,7 +872,7 @@ examples:
   # 2. Set api_key of an LLM configuration; any other key (temperature, base_url, ...) works the same way.
   uv run python scripts/batch_agent_update.py --agent corso --set llm:openrouter:api_key=sk-...
   #    For a secret that must not land in shell history, keep it in a patch file instead:
-  uv run python scripts/batch_agent_update.py --agent corso --patch examples/patch-llm-openrouter.jsonc
+  uv run python scripts/batch_agent_update.py --agent corso --patch examples/patch-llm-openrouter.yml
 
   # 3. Add or overwrite an agent metadata key; --name is the shortcut for --metadata name=VALUE.
   #    Metadata keys are literal: dotted nesting is only available through --set.
@@ -900,15 +888,17 @@ examples:
   uv run python scripts/batch_agent_update.py --agent corso --set plugins:my_plugin:options.enabled=true
 
   # 6. Everything else.
-  #    A patch file is JSONC and carries the full shape: {"metadata": {...}, "llm": {...},
-  #    "chunking": {...}, "plugins": {...}, "active_plugins": {...}}.
-  #    It accepts // and /* */ comments and trailing commas. Copy and adapt:
-  #      examples/patch-llm-openrouter.jsonc  one LLM change on OpenRouter
-  #      examples/patch-full-agent.jsonc      metadata + all settings + active_plugins
-  #    "active_plugins": {"my_plugin": true} reconciles like --plugin, and an explicit
-  #    --plugin NAME=on|off on the command line wins over the same name in the file.
-  uv run python scripts/batch_agent_update.py --agent corso --patch examples/patch-full-agent.jsonc
-  uv run python scripts/batch_agent_update.py --agent corso --patch examples/patch-llm-openrouter.jsonc
+  #    A patch file is YAML (recommended) or plain JSON and carries the full shape:
+  #    metadata, llm, chunking, plugins, active_plugins.
+  #    Comments start with '#'; quote a value that contains '#', e.g. api_key: "sk-abc#def".
+  #    JSONC '//' comments are no longer accepted: migrate them to '#' once.
+  #    Copy and adapt:
+  #      examples/patch-llm-openrouter.yml  one LLM change on OpenRouter
+  #      examples/patch-full-agent.yml      metadata + all settings + active_plugins
+  #    active_plugins takes on/off (true/false/1/0 also work) and reconciles like
+  #    --plugin; an explicit --plugin NAME=on|off wins over the same name in the file.
+  uv run python scripts/batch_agent_update.py --agent corso --patch examples/patch-full-agent.yml
+  uv run python scripts/batch_agent_update.py --agent corso --patch examples/patch-llm-openrouter.yml
   #    Several agents at once, minus the test ones.
   uv run python scripts/batch_agent_update.py --agent corso --agent lab --exclude test --metadata label=production
   #    Every non-system agent, writing with a before-snapshot.
@@ -980,7 +970,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--patch",
         metavar="FILE",
-        help="JSONC file with per-category patches and active_plugins",
+        help="YAML (or plain JSON) file with per-category patches and active_plugins",
     )
     parser.add_argument(
         "--yes",

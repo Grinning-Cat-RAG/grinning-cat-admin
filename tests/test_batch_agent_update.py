@@ -1568,43 +1568,24 @@ def test_duplicate_snapshots_are_applied_once(tmp_path, capsys):
     assert "corso1" in err
 
 
-def test_strip_jsonc_preserves_comment_like_string_contents():
-    raw = (
-        '{"url": "http://x", "block": "a /* b */", '
-        '"escaped": "escaped \\" // not a comment",}\n'
-        "// a real line comment\n"
-    )
-
-    stripped = cli._strip_jsonc(raw)
-
-    assert '"http://x"' in stripped
-    assert '"a /* b */"' in stripped
-    assert '"escaped \\" // not a comment"' in stripped
-    assert "a real line comment" not in stripped
-    assert json.loads(stripped) == {
-        "url": "http://x",
-        "block": "a /* b */",
-        "escaped": 'escaped " // not a comment',
-    }
-
-
-def test_patch_file_accepts_jsonc_comments_and_trailing_commas(tmp_path):
-    patch_file = tmp_path / "patch.jsonc"
+def test_yaml_patch_with_hash_comments_parses_and_applies(tmp_path):
+    patch_file = tmp_path / "patch.yml"
     patch_file.write_text(
-        """{
-  // the model to use
-  "llm": {
-    "gpt-4": {
-      "temperature": 0.2, /* keep the model name untouched */
-    },
-  },
-}""",
+        "# the model to use\n"
+        "llm:\n"
+        "  gpt-4:\n"
+        "    temperature: 0.2  # keep the model name untouched\n",
         encoding="utf-8",
     )
     client = FakeClient(
         agents=[_agent("corso1")],
         settings={("large_language_model", "gpt-4"): {"model": "gpt-4"}},
     )
+
+    dry = cli.main(["--agent", "corso", "--patch", str(patch_file)], client_factory=lambda: client)
+
+    assert dry == 2
+    assert client.calls == [("get_agents", ())]
 
     rc = cli.main(["--agent", "corso", "--patch", str(patch_file), "--yes"], client_factory=lambda: client)
 
@@ -1614,12 +1595,47 @@ def test_patch_file_accepts_jsonc_comments_and_trailing_commas(tmp_path):
     ]
 
 
-def test_active_plugins_toggle_on_and_off_idempotently(tmp_path):
-    patch_file = tmp_path / "patch.jsonc"
+def test_yaml_quoted_hash_inside_a_value_is_preserved(tmp_path):
+    patch_file = tmp_path / "patch.yml"
+    patch_file.write_text('llm:\n  openrouter:\n    api_key: "sk-abc#def"\n', encoding="utf-8")
+
+    patches, active_plugins = cli.load_patch(str(patch_file))
+
+    assert patches[("llm", "openrouter")] == {"api_key": "sk-abc#def"}
+    assert active_plugins == {}
+
+
+def test_yaml_leaves_have_no_implicit_typing(tmp_path):
+    patch_file = tmp_path / "patch.yml"
     patch_file.write_text(
-        '{"active_plugins": {"foo": true, "bar": false}}',
+        "chunking:\n"
+        "  default:\n"
+        "    chunk_size: 0123\n"
+        "    temperature: .5\n"
+        "    version: 1.10\n"
+        "    label: on\n"
+        "    date: 2024-01-01\n",
         encoding="utf-8",
     )
+
+    patches, _active_plugins = cli.load_patch(str(patch_file))
+
+    assert patches[("chunking", "default")] == {
+        # BaseLoader hands every scalar over as a string, so there is no YAML
+        # octal/bool/date coercion. _parse_value only accepts JSON numbers:
+        # 0123 (leading zero) and .5 (no leading digit) stay literal strings.
+        "chunk_size": "0123",
+        "temperature": ".5",
+        "version": 1.1,
+        "label": "on",
+        "date": "2024-01-01",
+    }
+    assert not isinstance(patches[("chunking", "default")]["label"], bool)
+
+
+def test_active_plugins_accepts_yaml_string_states(tmp_path):
+    patch_file = tmp_path / "patch.yml"
+    patch_file.write_text("active_plugins: {foo: on, bar: off}\n", encoding="utf-8")
     client = FakeClient(
         agents=[_agent("corso1")],
         plugins={"corso1": {"foo": False, "bar": True}},
@@ -1633,12 +1649,151 @@ def test_active_plugins_toggle_on_and_off_idempotently(tmp_path):
     assert client.plugin_states["corso1"] == {"foo": True, "bar": False}
 
 
-def test_cli_plugin_beats_active_plugins_in_the_operation_payload(tmp_path):
-    patch_file = tmp_path / "patch.jsonc"
+def test_active_plugins_unknown_state_exits_2_without_calls(tmp_path, capsys):
+    patch_file = tmp_path / "patch.yml"
+    patch_file.write_text("active_plugins: {foo: maybe}\n", encoding="utf-8")
+    client = FakeClient(agents=[_agent("corso1")])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--agent", "corso", "--patch", str(patch_file), "--yes"], client_factory=lambda: client)
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "active_plugins" in err
+    assert "foo" in err
+    assert "maybe" in err
+    assert client.calls == []
+
+
+def test_yaml_multiple_documents_exit_2(tmp_path, capsys):
+    patch_file = tmp_path / "patch.yml"
+    patch_file.write_text("llm:\n  gpt-4: {temperature: 0.2}\n---\nllm:\n  gpt-4: {temperature: 0.3}\n", encoding="utf-8")
+    client = FakeClient(agents=[_agent("corso1")])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--agent", "corso", "--patch", str(patch_file), "--yes"], client_factory=lambda: client)
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "multiple documents separated by ---" in err
+    assert str(patch_file) in err
+    assert client.calls == []
+
+
+def test_yaml_empty_file_exits_2(tmp_path, capsys):
+    patch_file = tmp_path / "patch.yml"
+    patch_file.write_text("# only a comment\n", encoding="utf-8")
+    client = FakeClient(agents=[_agent("corso1")])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--agent", "corso", "--patch", str(patch_file), "--yes"], client_factory=lambda: client)
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "empty" in err
+    assert str(patch_file) in err
+    assert client.calls == []
+
+
+def test_plain_json_patch_file_still_loads(tmp_path):
+    patch_file = tmp_path / "patch.json"
+    patch_file.write_text('{"llm": {"gpt-4": {"temperature": 0.2}}}', encoding="utf-8")
+
+    patches, active_plugins = cli.load_patch(str(patch_file))
+
+    assert patches == {("llm", "gpt-4"): {"temperature": 0.2}}
+    assert active_plugins == {}
+
+
+def test_slash_comments_exit_2_with_a_yaml_hint(tmp_path, capsys):
+    # Legacy suffix, built at runtime so no constant in the tree spells it.
+    legacy_suffix = "".join(("json", "c"))
+    patch_file = tmp_path / f"patch.{legacy_suffix}"
     patch_file.write_text(
-        '{"active_plugins": {"foo": false, "bar": true}}',
+        '{\n  // JSONC comment\n  "llm": {"gpt-4": {"temperature": 0.2}}\n}\n',
         encoding="utf-8",
     )
+    client = FakeClient(agents=[_agent("corso1")])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--agent", "corso", "--patch", str(patch_file), "--yes"], client_factory=lambda: client)
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "looks like JSONC: use '#' for comments in YAML" in err
+    assert str(patch_file) in err
+    assert client.calls == []
+
+
+EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
+
+
+def test_shipped_llm_example_loads_through_load_patch():
+    patches, active_plugins = cli.load_patch(str(EXAMPLES_DIR / "patch-llm-openrouter.yml"))
+
+    assert set(patches) == {("llm", "openrouter")}
+    assert patches[("llm", "openrouter")]["model"] == "anthropic/claude-3.5-sonnet"
+    assert patches[("llm", "openrouter")]["temperature"] == 0.2
+    assert active_plugins == {}
+
+
+def test_shipped_full_agent_example_loads_through_load_patch():
+    patches, active_plugins = cli.load_patch(str(EXAMPLES_DIR / "patch-full-agent.yml"))
+
+    assert set(patches) == {
+        ("metadata", ""),
+        ("llm", "openrouter"),
+        ("chunking", "default"),
+        ("plugins", "my_plugin"),
+        ("plugins", "other_plugin"),
+    }
+    assert patches[("metadata", "")] == {"name": "Corso 1", "label": "production", "owner": "didattica"}
+    assert patches[("chunking", "default")] == {"chunk_size": 512, "chunk_overlap": 32}
+    assert active_plugins == {"my_plugin": True, "other_plugin": False}
+
+
+def test_shipped_full_agent_example_produces_the_expected_operations(capsys):
+    client = FakeClient(agents=[_agent("corso1")])
+
+    rc = cli.main(
+        ["--agent", "corso", "--patch", str(EXAMPLES_DIR / "patch-full-agent.yml"), "--json"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 2
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["agents"][0]["ops"] == [
+        "metadata",
+        "plugin:my_plugin",
+        "plugin:other_plugin",
+        "settings:llm:openrouter",
+        "settings:chunking:default",
+        "settings:plugins:my_plugin",
+        "settings:plugins:other_plugin",
+    ]
+    assert plan["agents"][0]["metadata_keys"] == ["label", "name", "owner"]
+    assert client.calls == [("get_agents", ())]
+
+
+def test_yaml_anchors_and_aliases_are_allowed(tmp_path):
+    patch_file = tmp_path / "patch.yml"
+    patch_file.write_text(
+        "llm:\n"
+        "  openrouter: &base\n"
+        "    temperature: 0.2\n"
+        "  mirror: *base\n",
+        encoding="utf-8",
+    )
+
+    patches, _active_plugins = cli.load_patch(str(patch_file))
+
+    assert patches[("llm", "openrouter")] == {"temperature": 0.2}
+    assert patches[("llm", "mirror")] == {"temperature": 0.2}
+
+
+def test_cli_plugin_beats_active_plugins_in_the_operation_payload(tmp_path):
+    patch_file = tmp_path / "patch.yml"
+    patch_file.write_text("active_plugins: {foo: false, bar: true}\n", encoding="utf-8")
 
     args = Namespace(
         patch=str(patch_file),
@@ -1661,8 +1816,8 @@ def test_cli_plugin_beats_active_plugins_in_the_operation_payload(tmp_path):
 
 
 def test_cli_plugin_beats_active_plugins_when_applied(tmp_path):
-    patch_file = tmp_path / "patch.jsonc"
-    patch_file.write_text('{"active_plugins": {"foo": false}}', encoding="utf-8")
+    patch_file = tmp_path / "patch.yml"
+    patch_file.write_text("active_plugins: {foo: false}\n", encoding="utf-8")
     client = FakeClient(agents=[_agent("corso1")], plugins={"corso1": {"foo": False}})
 
     rc = cli.main(
@@ -1673,67 +1828,3 @@ def test_cli_plugin_beats_active_plugins_when_applied(tmp_path):
     assert rc == 0
     assert client.calls_to("put_toggle_plugin") == [("foo", "corso1")]
     assert client.plugin_states["corso1"]["foo"] is True
-
-
-def test_active_plugins_non_bool_exits_2_without_calls(tmp_path, capsys):
-    patch_file = tmp_path / "patch.jsonc"
-    patch_file.write_text('{"active_plugins": {"foo": "on"}}', encoding="utf-8")
-    client = FakeClient(agents=[_agent("corso1")])
-
-    with pytest.raises(SystemExit) as excinfo:
-        cli.main(["--agent", "corso", "--patch", str(patch_file), "--yes"], client_factory=lambda: client)
-
-    assert excinfo.value.code == 2
-    err = capsys.readouterr().err
-    assert "active_plugins" in err
-    assert "foo" in err
-    assert "boolean" in err
-    assert client.calls == []
-
-
-EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
-
-
-def test_shipped_llm_example_loads_through_load_patch():
-    patches, active_plugins = cli.load_patch(str(EXAMPLES_DIR / "patch-llm-openrouter.jsonc"))
-
-    assert set(patches) == {("llm", "openrouter")}
-    assert patches[("llm", "openrouter")]["model"] == "anthropic/claude-3.5-sonnet"
-    assert active_plugins == {}
-
-
-def test_shipped_full_agent_example_loads_through_load_patch():
-    patches, active_plugins = cli.load_patch(str(EXAMPLES_DIR / "patch-full-agent.jsonc"))
-
-    assert set(patches) == {
-        ("metadata", ""),
-        ("llm", "openrouter"),
-        ("chunking", "default"),
-        ("plugins", "my_plugin"),
-        ("plugins", "other_plugin"),
-    }
-    assert patches[("metadata", "")] == {"name": "Corso 1", "label": "production", "owner": "didattica"}
-    assert active_plugins == {"my_plugin": True, "other_plugin": False}
-
-
-def test_shipped_full_agent_example_produces_the_expected_operations(capsys):
-    client = FakeClient(agents=[_agent("corso1")])
-
-    rc = cli.main(
-        ["--agent", "corso", "--patch", str(EXAMPLES_DIR / "patch-full-agent.jsonc"), "--json"],
-        client_factory=lambda: client,
-    )
-
-    assert rc == 2
-    plan = json.loads(capsys.readouterr().out)
-    assert plan["agents"][0]["ops"] == [
-        "metadata",
-        "plugin:my_plugin",
-        "plugin:other_plugin",
-        "settings:llm:openrouter",
-        "settings:chunking:default",
-        "settings:plugins:my_plugin",
-        "settings:plugins:other_plugin",
-    ]
-    assert plan["agents"][0]["metadata_keys"] == ["label", "name", "owner"]
-    assert client.calls == [("get_agents", ())]

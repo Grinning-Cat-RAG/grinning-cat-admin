@@ -97,6 +97,100 @@ The admin interface supports two ways of authenticating against Grinning Cat Cor
   the whole UI is available to anyone who can reach it. Leave it unset unless
   the UI is only exposed to trusted users.
 
+## Batch agent updates
+
+`scripts/batch_agent_update.py` updates many agents in one run. It selects agents by a case-insensitive substring of `agent_id` (or every non-system agent with `--all`), then applies LLM, plugin, metadata and factory-setting patches through the official SDK and REST API. Nothing is written unless you pass `--yes`: the default is a dry run that prints the plan and exits with code 2.
+
+### Prerequisites
+
+The script reads the same environment as the admin UI:
+
+```env
+GRINNING_CAT_API_HOST=your-grinning-cat-instance
+GRINNING_CAT_API_PORT=1865
+GRINNING_CAT_API_KEY=your-api-key
+GRINNING_CAT_API_SECURE_CONNECTION=false
+```
+
+`GRINNING_CAT_API_KEY` is required; the other three fall back to `localhost`, `1865` and `false`. The key must carry the permissions for every resource the run touches: CHESHIRE_CAT (read and write), LLM, PLUGIN, CHUNKER, VECTOR_DATABASE, AUTH_HANDLER, AGENTIC_WORKFLOW, CONTEXT_RETRIEVER and FILE_MANAGER. Note that the core gates the single-setting chunker GET/PUT on AUTH_HANDLER, so a run that patches `chunking` needs that permission too. Add SYSTEM when you use `--allow-system-wide`.
+
+### Flags
+
+| Flag | Description |
+| --- | --- |
+| `--agent SUBSTRING` | agent id or a case-insensitive substring of it (repeatable) |
+| `--all` | every agent except system and `__*` |
+| `--exclude SUBSTRING` | drop agents whose id contains this substring, case-insensitive (repeatable) |
+| `--llm MODEL=JSON` | merge a JSON object into the LLM settings of MODEL (repeatable) |
+| `--plugin NAME=on\|off` | enable or disable a plugin (repeatable) |
+| `--metadata KEY=VALUE` | merge one metadata key (repeatable) |
+| `--name VALUE` | shortcut for `--metadata name=VALUE` |
+| `--set CATEGORY:NAME:KEY=VALUE` | patch one factory setting (repeatable) |
+| `--patch FILE` | JSON file with per-category patches |
+| `--yes` | apply the changes (default: dry-run) |
+| `--json` | print the plan as JSON |
+| `--backup-out DIR` | directory for the before-snapshot |
+| `--restore PATH` | restore a snapshot file or directory |
+| `--allow-system-wide` | allow system-wide categories such as embedder |
+| `--max-workers INT` | parallel workers, one task per agent (default: 1) |
+
+### Patch syntax
+
+`--set CATEGORY:NAME:KEY=VALUE` patches one factory setting. `CATEGORY` is one of `llm`, `chunking`, `vector_database`, `auth_handler`, `agentic_workflow`, `context_retriever`, `file_manager`, `plugins`, `metadata`, `embedder` or `ingestion`. `NAME` is the setting name (the model for `llm`, the plugin id for `plugins`). `KEY` may be dotted (`a.b.c`) to reach nested values. Values are decoded as JSON when possible, otherwise kept as strings.
+
+`--patch FILE` takes a JSON object keyed by category, then by name:
+
+```json
+{
+  "llm": {"gpt-4": {"temperature": 0.2}},
+  "plugins": {"foo": {"k": "v"}},
+  "metadata": {"name": "X"}
+}
+```
+
+### How the patches are applied
+
+- `--plugin NAME=on|off` reconciles: it reads the active flag and toggles only when the current state differs, then verifies the result. The core endpoint flips the flag rather than setting it, so a repeated command never toggles twice.
+- `--llm` and `--set` do a read-merge-write, because the core replaces the whole settings value on PUT. Only the keys you pass change; everything else is preserved.
+- `--metadata` merges into the existing metadata dict, for the same reason.
+
+### Safety
+
+- Dry run by default. `--yes` is required to write anything.
+- Before writing, each agent gets a snapshot under `--backup-out` (default `./agent-backup-<UTC stamp>`).
+- `--restore <dir|file>` re-applies a snapshot and is itself a dry run unless you add `--yes`.
+- `--allow-system-wide` is required for `embedder` and `ingestion`, because those settings re-embed every agent.
+- `--max-workers > 1` runs one task per agent in parallel.
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| 0 | every operation succeeded |
+| 1 | at least one agent or operation failed |
+| 2 | dry run, abort or usage error |
+
+### Examples
+
+Dry run against every agent whose id contains `prod`:
+
+```bash
+uv run python scripts/batch_agent_update.py \
+  --agent prod \
+  --llm gpt-4='{"temperature":0.2}'
+```
+
+Apply a plugin toggle and a metadata label to every non-system agent, keeping a snapshot in `./backup`:
+
+```bash
+uv run python scripts/batch_agent_update.py \
+  --all \
+  --plugin foo=on \
+  --metadata label=b \
+  --yes \
+  --backup-out ./backup
+```
+
 ## Contributing
 
 We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.

@@ -95,6 +95,18 @@ def _agent_role(agent_id: str) -> str:
     return "agent"
 
 
+def _ensure_system_agent(agents: list[AgentOutput]) -> list[AgentOutput]:
+    """Append a synthetic ``system`` agent when the SDK list omits it.
+
+    ``GET /utils/agents/`` only scans ``agents:*:agent``; the system agent
+    lives under ``system:agent`` and is never returned. Dump mode needs it, so
+    it is synthesized with empty metadata (the SDK does not expose it).
+    """
+    if any(agent.agent_id == "system" for agent in agents):
+        return list(agents)
+    return [*agents, AgentOutput(agent_id="system", metadata={})]
+
+
 def render_plan(
     selected: list[AgentOutput],
     ops: list[str],
@@ -668,38 +680,68 @@ def _dump_agent_config(
     agent: AgentOutput,
     categories: list[str],
     include_secrets: bool,
-    stats: dict[str, int] | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the patch-shaped payload for one agent from the live SDK state.
 
     When secrets are omitted, ``stats["omitted"]`` (if given) receives the
-    number of dropped keys so the caller can warn about them.
+    number of dropped keys so the caller can warn about them. ``stats["warnings"]``
+    collects non-fatal problems (inactive plugins, unreadable settings).
     """
     role = _agent_role(agent.agent_id)
+    warnings: list[str] = stats.setdefault("warnings", []) if stats is not None else []
+    if role == "system":
+        warnings.append("system metadata not exposed by the SDK")
     payload: dict[str, Any] = {}
     if "metadata" in categories:
         payload["metadata"] = dict(agent.metadata)
     for category in categories:
         if category in FACTORY_LIST_GETTERS:
-            name, value = _read_factory_selected(client, category, agent.agent_id)
-            payload[category] = {name: value}
+            try:
+                name, value = _read_factory_selected(client, category, agent.agent_id)
+            except Exception as exc:  # noqa: BLE001 - the system agent has no per-agent routes
+                if role != "system":
+                    raise
+                warnings.append(f"category skipped ({category}: {exc})")
+            else:
+                payload[category] = {name: value}
     if role == "system":
         for category in ("embedder", "ingestion"):
             if category in categories:
-                name, value = _read_factory_selected(client, category, None)
-                payload[category] = {name: value}
-    if "plugins" in categories:
-        collection = client.plugins.get_available_plugins(agent.agent_id)
-        payload["plugins"] = {
-            plugin.id: dict(client.plugins.get_plugin_settings(plugin.id, agent.agent_id).value)
-            for plugin in collection.installed
-        }
-    if "active_plugins" in categories:
-        collection = client.plugins.get_available_plugins(agent.agent_id)
-        payload["active_plugins"] = {
-            plugin.id: "on" if plugin.local_info.get("active") else "off"
-            for plugin in collection.installed
-        }
+                try:
+                    name, value = _read_factory_selected(client, category, None)
+                except Exception as exc:  # noqa: BLE001 - a missing system-wide endpoint must not abort
+                    warnings.append(f"category skipped ({category}: {exc})")
+                else:
+                    payload[category] = {name: value}
+    if "plugins" in categories or "active_plugins" in categories:
+        try:
+            collection = client.plugins.get_available_plugins(agent.agent_id)
+        except Exception as exc:  # noqa: BLE001 - the system agent has no plugin manager
+            warnings.append(f"plugin settings skipped ({exc})")
+        else:
+            installed = list(collection.installed)
+            if "plugins" in categories:
+                settings: dict[str, Any] = {}
+                inactive: list[str] = []
+                for plugin in installed:
+                    if not plugin.local_info.get("active"):
+                        inactive.append(plugin.id)
+                        continue
+                    try:
+                        settings[plugin.id] = dict(
+                            client.plugins.get_plugin_settings(plugin.id, agent.agent_id).value
+                        )
+                    except Exception as exc:  # noqa: BLE001 - one plugin must not abort the dump
+                        warnings.append(f"plugin settings skipped ({plugin.id}: {exc})")
+                payload["plugins"] = settings
+                if inactive:
+                    warnings.append(f"plugin settings skipped (inactive: {', '.join(inactive)})")
+            if "active_plugins" in categories:
+                payload["active_plugins"] = {
+                    plugin.id: "on" if plugin.local_info.get("active") else "off"
+                    for plugin in installed
+                }
     if not include_secrets:
         if stats is not None:
             stats["omitted"] = stats.get("omitted", 0) + _count_secret_keys(payload)
@@ -937,7 +979,7 @@ def dump_configs(
             "reason": None,
         }
         try:
-            stats = {"omitted": 0}
+            stats: dict[str, Any] = {"omitted": 0, "warnings": []}
             payload = _dump_agent_config(client, agent, effective, include_secrets, stats=stats)
             entry["selected"] = {
                 category: next(iter(value))
@@ -946,6 +988,7 @@ def dump_configs(
             }
             entry["plugins"] = len(payload.get("plugins", {}))
             entry["omitted_secrets"] = stats["omitted"]
+            entry["warnings"].extend(stats["warnings"])
             if stats["omitted"]:
                 entry["warnings"].append(
                     f"secrets omitted ({stats['omitted']} fields); reload preserves them"
@@ -1126,7 +1169,7 @@ def dump_manifest_only(
                 for category in effective
                 if category in FACTORY_LIST_GETTERS or category in SYSTEM_WIDE_CATEGORIES
             ]
-            stats = {"omitted": 0}
+            stats: dict[str, Any] = {"omitted": 0, "warnings": []}
             payload = _dump_agent_config(
                 client, agent, factory_categories, include_secrets, stats=stats
             )
@@ -1135,9 +1178,14 @@ def dump_manifest_only(
                 for category, value in payload.items()
                 if category in FACTORY_LIST_GETTERS or category in SYSTEM_WIDE_CATEGORIES
             }
-            collection = client.plugins.get_available_plugins(agent.agent_id)
-            entry["plugins"] = len(collection.installed)
             entry["omitted_secrets"] = stats["omitted"]
+            entry["warnings"].extend(stats["warnings"])
+            try:
+                collection = client.plugins.get_available_plugins(agent.agent_id)
+            except Exception as exc:  # noqa: BLE001 - the system agent has no plugin manager
+                entry["warnings"].append(f"plugin settings skipped ({exc})")
+            else:
+                entry["plugins"] = len(collection.installed)
             if stats["omitted"]:
                 entry["warnings"].append(
                     f"secrets omitted ({stats['omitted']} fields); reload preserves them"
@@ -1653,6 +1701,9 @@ def _run_dump(
     except Exception as exc:  # noqa: BLE001 - CLI boundary: report the discovery failure
         print(f"cannot list agents: {exc}", file=sys.stderr)
         return 1
+    # Dump mode only: the SDK list never contains the system agent, but the
+    # dump must be able to capture it. The update path keeps the SDK list.
+    agents = _ensure_system_agent(agents)
     try:
         selected = select_agents(
             agents,

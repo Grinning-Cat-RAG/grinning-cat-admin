@@ -266,6 +266,8 @@ class FakeClient:
         concurrency_guard=False,
         disappearing_plugins=None,
         factory_lists=None,
+        plugin_settings_500_inactive=False,
+        plugin_settings_fail=None,
     ):
         self.calls = []
         self.agents = list(agents or [])
@@ -277,6 +279,8 @@ class FakeClient:
             (agent_id, plugin_id): dict(values)
             for (agent_id, plugin_id), values in (plugin_settings or {}).items()
         }
+        self.plugin_settings_500_inactive = plugin_settings_500_inactive
+        self.plugin_settings_fail = set(plugin_settings_fail or ())
         self.plugin_settings_payloads = []
         self.toggle_noop = toggle_noop
         self.concurrency_guard = concurrency_guard
@@ -349,6 +353,12 @@ class FakeClient:
             return self.factory_lists[(attribute, agent_id)]
         if method_name == "get_plugin_settings":
             plugin_id, agent_id = args
+            if plugin_id in self.plugin_settings_fail:
+                raise RuntimeError(f"500 Server Error for plugin {plugin_id!r}")
+            if self.plugin_settings_500_inactive and not self.plugin_states.get(agent_id, {}).get(
+                plugin_id
+            ):
+                raise RuntimeError(f"500 Server Error: KeyError {plugin_id!r}")
             return FactoryObjectSettingOutput(
                 name=plugin_id, value=dict(self.plugin_settings.get((agent_id, plugin_id), {}))
             )
@@ -2214,7 +2224,9 @@ def test_dump_agent_config_reads_every_requested_category():
     assert payload["metadata"] == {"name": "Corso"}
     assert payload["llm"] == {"LLMOpenRouterConfig": {"model": "m"}}
     assert payload["chunking"] == {"Chunker": {"chunk_size": 100}}
-    assert payload["plugins"] == {"foo": {"opt": 1}, "bar": {}}
+    # Inactive plugins are listed in active_plugins but their settings are not
+    # read: the core answers 500 for them.
+    assert payload["plugins"] == {"foo": {"opt": 1}}
     assert payload["active_plugins"] == {"foo": "on", "bar": "off"}
 
 
@@ -2351,6 +2363,10 @@ def _full_factory_lists(agent_id):
     for category, (attribute, _getter) in cli.FACTORY_LIST_GETTERS.items():
         name, value = values[category]
         lists[(attribute, agent_id)] = _factory_list(name, {name: value})
+    # The system agent always exists in a deployment and --dump --all now
+    # includes it, so every complete fixture carries its factory lists too.
+    if agent_id != "system":
+        lists.update(_system_factory_lists())
     return lists
 
 
@@ -2472,8 +2488,9 @@ def test_main_dump_json_envelope(tmp_path, capsys):
 
     assert rc == 0
     data = json.loads(capsys.readouterr().out)
-    assert data["summary"] == {"selected": 1, "ok": 1, "failed": 0}
+    assert data["summary"] == {"selected": 2, "ok": 2, "failed": 0}
     assert data["agents"][0]["agent_id"] == "corso"
+    assert data["agents"][1]["agent_id"] == "system"
 
 
 def test_main_dump_all_includes_system_and_widgets(tmp_path):
@@ -2515,7 +2532,10 @@ def test_dump_only_llm_writes_only_llm(tmp_path):
         factory_lists={
             ("large_language_model", "corso"): _factory_list(
                 "LLMOpenRouterConfig", {"LLMOpenRouterConfig": {"model": "m"}}
-            )
+            ),
+            ("large_language_model", "system"): _factory_list(
+                "LLMOpenRouterConfig", {"LLMOpenRouterConfig": {"model": "m"}}
+            ),
         },
     )
 
@@ -2862,7 +2882,10 @@ def test_dump_secrets_flag_keeps_secrets_in_the_file(tmp_path):
         factory_lists={
             ("large_language_model", "corso"): _factory_list(
                 "LLMOpenRouterConfig", {"LLMOpenRouterConfig": {"api_key": "sk-1"}}
-            )
+            ),
+            ("large_language_model", "system"): _factory_list(
+                "LLMOpenRouterConfig", {"LLMOpenRouterConfig": {"api_key": "sk-1"}}
+            ),
         },
     )
 
@@ -2914,6 +2937,9 @@ def _round_trip_factory_lists(agent_id, api_key=None):
 
 def _round_trip_client(agent_ids, api_key=None):
     """A fake client holding a complete, dumpable configuration per agent."""
+    agent_ids = list(agent_ids)
+    if "system" not in agent_ids:
+        agent_ids.append("system")
     agents = [_agent(agent_id, metadata={"name": agent_id}) for agent_id in agent_ids]
     lists = {}
     for agent_id in agent_ids:
@@ -3140,3 +3166,194 @@ def test_default_dump_omits_secrets_and_counts_them(tmp_path):
     assert entry["omitted_secrets"] >= 1
     assert "secrets omitted" in entry["warnings"][0]
     assert _put_calls(client) == []
+
+
+# --- F3 fix: system synthesis and inactive plugin settings -----------------
+
+
+def test_ensure_system_agent_appends_a_synthetic_system_agent():
+    agents = [_agent("corso")]
+
+    ensured = cli._ensure_system_agent(agents)
+
+    assert [agent.agent_id for agent in ensured] == ["corso", "system"]
+    assert ensured[-1].metadata == {}
+    assert [agent.agent_id for agent in agents] == ["corso"]
+
+
+def test_ensure_system_agent_keeps_an_existing_system_agent():
+    agents = [_agent("system", {"name": "System"}), _agent("corso")]
+
+    ensured = cli._ensure_system_agent(agents)
+
+    assert [agent.agent_id for agent in ensured] == ["system", "corso"]
+    assert ensured[0].metadata == {"name": "System"}
+
+
+def test_main_dump_agent_system_is_synthesized_when_the_sdk_omits_it(tmp_path, capsys):
+    agents = [_agent("corso")]
+    client = FakeClient(agents=agents, factory_lists=_system_factory_lists())
+
+    rc = cli.main(["--dump", str(tmp_path), "--agent", "system"], client_factory=lambda: client)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "agent=system role=system" in out
+    assert "result=ok" in out
+    path = tmp_path / cli._dump_filename("system")
+    assert path.exists()
+    payload = _dump_body(path)
+    assert payload["metadata"] == {}
+    assert "embedder" in payload
+    assert "ingestion" in payload
+
+
+def test_main_dump_all_includes_the_synthesized_system_agent(tmp_path):
+    agents = [_agent("corso")]
+    client = FakeClient(agents=agents, factory_lists=_full_factory_lists("corso"))
+
+    rc = cli.main(["--dump", str(tmp_path), "--all"], client_factory=lambda: client)
+
+    assert rc == 0
+    manifest = yaml.safe_load((tmp_path / "manifest.yml").read_text(encoding="utf-8"))
+    roles = {entry["agent_id"]: entry["role"] for entry in manifest["agents"]}
+    assert roles == {"corso": "agent", "system": "system"}
+
+
+def test_update_path_never_synthesizes_the_system_agent(capsys):
+    client = FakeClient(agents=[_agent("corso")])
+
+    rc = cli.main(["--agent", "system", "--llm", "gpt-4={}"], client_factory=lambda: client)
+
+    assert rc == 2
+    assert "no agent id contains 'system'" in capsys.readouterr().err
+
+
+def test_dump_agent_config_skips_inactive_plugin_settings():
+    client = FakeClient(
+        plugins={"corso": {"foo": True, "bar": False}},
+        plugin_settings={("corso", "foo"): {"opt": 1}, ("corso", "bar"): {"opt": 2}},
+        plugin_settings_500_inactive=True,
+    )
+    stats = {"omitted": 0, "warnings": []}
+
+    payload = cli._dump_agent_config(
+        client,
+        _agent("corso"),
+        ["plugins", "active_plugins"],
+        include_secrets=False,
+        stats=stats,
+    )
+
+    assert payload["plugins"] == {"foo": {"opt": 1}}
+    assert payload["active_plugins"] == {"foo": "on", "bar": "off"}
+    assert stats["warnings"] == ["plugin settings skipped (inactive: bar)"]
+    assert client.calls_to("get_plugin_settings") == [("foo", "corso")]
+
+
+def test_dump_agent_config_isolates_a_failing_plugin_settings_read():
+    client = FakeClient(
+        plugins={"corso": {"foo": True, "bar": True}},
+        plugin_settings={("corso", "foo"): {"opt": 1}},
+        plugin_settings_fail={"bar"},
+    )
+    stats = {"omitted": 0, "warnings": []}
+
+    payload = cli._dump_agent_config(
+        client, _agent("corso"), ["plugins"], include_secrets=False, stats=stats
+    )
+
+    assert payload["plugins"] == {"foo": {"opt": 1}}
+    assert len(stats["warnings"]) == 1
+    assert "plugin settings skipped (bar:" in stats["warnings"][0]
+
+
+def test_dump_configs_records_the_system_metadata_warning(tmp_path):
+    agents = [_agent("system")]
+    client = FakeClient(agents=agents, factory_lists=_system_factory_lists())
+
+    envelope = cli.dump_configs(client, agents, tmp_path, cli.DUMP_CATEGORIES, False, [], 1)
+
+    entry = envelope["agents"][0]
+    assert entry["ok"] is True
+    assert "system metadata not exposed by the SDK" in entry["warnings"]
+    header = (tmp_path / cli._dump_filename("system")).read_text(encoding="utf-8")
+    assert "# warnings: system metadata not exposed by the SDK" in header
+    manifest = yaml.safe_load((tmp_path / "manifest.yml").read_text(encoding="utf-8"))
+    assert "system metadata not exposed by the SDK" in manifest["agents"][0]["warnings"]
+
+
+def test_main_dump_all_succeeds_with_an_inactive_plugin(tmp_path, capsys):
+    agents = [_agent("corso")]
+    client = FakeClient(
+        agents=agents,
+        factory_lists=_full_factory_lists("corso"),
+        plugins={"corso": {"foo": True, "bar": False}},
+        plugin_settings={("corso", "foo"): {"opt": 1}},
+        plugin_settings_500_inactive=True,
+    )
+
+    rc = cli.main(["--dump", str(tmp_path), "--all"], client_factory=lambda: client)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "agent=corso role=agent" in out
+    assert "result=ok" in out
+    path = tmp_path / cli._dump_filename("corso")
+    payload = _dump_body(path)
+    assert payload["plugins"] == {"foo": {"opt": 1}}
+    assert payload["active_plugins"] == {"foo": "on", "bar": "off"}
+    header = path.read_text(encoding="utf-8")
+    assert "plugin settings skipped (inactive: bar)" in header
+
+
+def test_dump_agent_config_system_tolerates_missing_per_agent_routes():
+    client = FakeClient(
+        factory_lists={
+            ("embedder", None): _factory_list(
+                "OpenAIEmbedder", {"OpenAIEmbedder": {"model": "e"}}
+            ),
+        },
+        fail_on={
+            "get_large_language_model_settings",
+            "get_chunkers_settings",
+            "get_vector_databases_settings",
+            "get_auth_handlers_settings",
+            "get_agentic_workflows_settings",
+            "get_context_retrievers_settings",
+            "get_file_managers_settings",
+            "get_available_plugins",
+        },
+    )
+    stats = {"omitted": 0, "warnings": []}
+
+    payload = cli._dump_agent_config(
+        client, _agent("system"), cli.DUMP_CATEGORIES, include_secrets=False, stats=stats
+    )
+
+    assert payload["metadata"] == {}
+    assert payload["embedder"] == {"OpenAIEmbedder": {"model": "e"}}
+    assert "ingestion" not in payload
+    assert "system metadata not exposed by the SDK" in stats["warnings"]
+    assert any("category skipped (llm:" in warning for warning in stats["warnings"])
+    assert any("plugin settings skipped" in warning for warning in stats["warnings"])
+
+
+def test_dump_manifest_only_tolerates_a_system_without_plugin_manager(tmp_path):
+    agents = [_agent("system")]
+    client = FakeClient(
+        agents=agents,
+        factory_lists=_system_factory_lists(),
+        fail_on={("get_available_plugins", "system")},
+    )
+
+    rc = cli.main(
+        ["--dump", str(tmp_path), "--all", "--dump-manifest-only"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    manifest = yaml.safe_load((tmp_path / "manifest.yml").read_text(encoding="utf-8"))
+    entry = manifest["agents"][0]
+    assert entry["plugins"] == 0
+    assert any("plugin settings skipped" in warning for warning in entry["warnings"])

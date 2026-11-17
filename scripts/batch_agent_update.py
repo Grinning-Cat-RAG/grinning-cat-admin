@@ -643,6 +643,13 @@ def _strip_secrets(value: Any) -> Any:
     return value
 
 
+def _effective_categories(categories: list[str], role: str) -> list[str]:
+    """Drop system-wide categories for agents that cannot own them."""
+    if role == "system":
+        return list(categories)
+    return [category for category in categories if category not in SYSTEM_WIDE_CATEGORIES]
+
+
 def _dump_agent_config(
     client: Any,
     agent: AgentOutput,
@@ -895,11 +902,12 @@ def dump_configs(
 
     def run(agent: AgentOutput) -> dict[str, Any]:
         role = _agent_role(agent.agent_id)
+        effective = _effective_categories(categories, role)
         entry: dict[str, Any] = {
             "agent_id": agent.agent_id,
             "role": role,
             "file": None,
-            "categories": list(categories),
+            "categories": effective,
             "selected": {},
             "plugins": 0,
             "warnings": [],
@@ -907,7 +915,7 @@ def dump_configs(
             "reason": None,
         }
         try:
-            payload = _dump_agent_config(client, agent, categories, include_secrets)
+            payload = _dump_agent_config(client, agent, effective, include_secrets)
             entry["selected"] = {
                 category: next(iter(value))
                 for category, value in payload.items()
@@ -917,7 +925,7 @@ def dump_configs(
             header = _dump_header(
                 agent.agent_id,
                 role,
-                categories,
+                effective,
                 entry["selected"],
                 argv,
                 host,
@@ -1375,6 +1383,13 @@ def _validate(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None
             parser.error(f"--dump cannot be combined with --{conflicting[0]}")
         if not args.agent and not args.all:
             parser.error("--dump requires --agent or --all")
+        if args.dump_only:
+            unknown = [category for category in args.dump_only if category not in DUMP_CATEGORIES]
+            if unknown:
+                parser.error(
+                    f"unknown --dump-only category {unknown[0]!r}; "
+                    f"valid categories: {', '.join(DUMP_CATEGORIES)}"
+                )
         if args.diff and not Path(args.dump).is_dir():
             parser.error(f"--diff requires an existing directory: {args.dump!r}")
         return
@@ -1401,7 +1416,12 @@ def _validate(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None
         parser.error("--agent or --all is required")
 
 
-def _run_dump(args: argparse.Namespace, argv: list[str] | None, client_factory) -> int:
+def _run_dump(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    argv: list[str] | None,
+    client_factory,
+) -> int:
     """Read the selected agents through the SDK and write the dump files."""
     client = client_factory()
     if client is None:
@@ -1424,6 +1444,12 @@ def _run_dump(args: argparse.Namespace, argv: list[str] | None, client_factory) 
         return 2
 
     categories = list(args.dump_only) if args.dump_only else list(DUMP_CATEGORIES)
+    if args.dump_only:
+        system_wide = [category for category in categories if category in SYSTEM_WIDE_CATEGORIES]
+        if system_wide and any(_agent_role(agent.agent_id) != "system" for agent in selected):
+            parser.error(
+                f"--dump-only {system_wide[0]} is system-wide and requires only the system agent"
+            )
     envelope = dump_configs(
         client,
         selected,
@@ -1450,7 +1476,7 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
         parser.error("--max-workers must be at least 1")
 
     if args.dump:
-        return _run_dump(args, argv, client_factory)
+        return _run_dump(parser, args, argv, client_factory)
 
     snapshots = None
     system_wide: list[Operation] = []

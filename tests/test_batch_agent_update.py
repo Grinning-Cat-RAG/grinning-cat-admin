@@ -2503,3 +2503,88 @@ def test_main_dump_system_includes_embedder_and_ingestion(tmp_path):
     payload = _dump_body(tmp_path / cli._dump_filename("system"))
     assert "embedder" in payload
     assert "ingestion" in payload
+
+
+# --- Todo 6: --dump-only category filtering --------------------------------
+
+
+def test_dump_only_llm_writes_only_llm(tmp_path):
+    agents = [_agent("corso")]
+    client = FakeClient(
+        agents=agents,
+        factory_lists={
+            ("large_language_model", "corso"): _factory_list(
+                "LLMOpenRouterConfig", {"LLMOpenRouterConfig": {"model": "m"}}
+            )
+        },
+    )
+
+    rc = cli.main(
+        ["--dump", str(tmp_path), "--all", "--dump-only", "llm"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    path = tmp_path / cli._dump_filename("corso")
+    assert list(_dump_body(path)) == ["llm"]
+    assert "# categories: llm" in path.read_text(encoding="utf-8").splitlines()
+
+
+def test_dump_only_unknown_category_exits_2(tmp_path, capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(
+            ["--dump", str(tmp_path), "--all", "--dump-only", "nope"],
+            client_factory=_forbidden_factory,
+        )
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "nope" in err
+    assert "llm" in err
+
+
+def test_dump_only_system_wide_with_a_non_system_agent_exits_2(tmp_path, capsys):
+    agents = [_agent("corso")]
+    client = FakeClient(agents=agents)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(
+            ["--dump", str(tmp_path), "--all", "--dump-only", "embedder"],
+            client_factory=lambda: client,
+        )
+
+    assert excinfo.value.code == 2
+    assert "embedder" in capsys.readouterr().err
+
+
+def test_dump_only_embedder_with_system_works(tmp_path):
+    agents = [_agent("system")]
+    client = FakeClient(
+        agents=agents,
+        factory_lists={
+            ("embedder", None): _factory_list(
+                "OpenAIEmbedder", {"OpenAIEmbedder": {"api_key": "sk-1"}}
+            )
+        },
+    )
+
+    rc = cli.main(
+        ["--dump", str(tmp_path), "--agent", "system", "--dump-only", "embedder"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert list(_dump_body(tmp_path / cli._dump_filename("system"))) == ["embedder"]
+
+
+def test_dump_header_categories_exclude_system_wide_for_agents(tmp_path):
+    agents = [_agent("corso")]
+    client = FakeClient(agents=agents, factory_lists=_full_factory_lists("corso"))
+
+    rc = cli.main(["--dump", str(tmp_path), "--all"], client_factory=lambda: client)
+
+    assert rc == 0
+    header = (tmp_path / cli._dump_filename("corso")).read_text(encoding="utf-8").splitlines()
+    categories_line = next(line for line in header if line.startswith("# categories: "))
+    assert "embedder" not in categories_line
+    assert "ingestion" not in categories_line

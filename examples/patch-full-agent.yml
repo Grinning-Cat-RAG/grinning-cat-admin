@@ -42,11 +42,10 @@ plugins:
       threshold: 0.7
   other_plugin:
     api_key: "REPLACE-ME"
-    # A dotted key is literal in a patch file: this writes the key
-    # "http.timeout" with a nested {"seconds": 30} value, not
-    # {"http": {"timeout": {"seconds": 30}}}. Use --set for real nesting.
-    http.timeout:
-      seconds: 30
+    # A dotted key is literal here: express real nesting with YAML maps (use --set for dotted keys).
+    http:
+      timeout:
+        seconds: 30
 
 # Active plugin set: on enables, off disables (true/false/1/0 work too).
 # Reconciled like --plugin, so a repeated run never toggles twice. An explicit

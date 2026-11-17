@@ -157,7 +157,7 @@ def test_configuration_reads_the_environment(monkeypatch):
 def test_missing_api_key_exits_2_without_a_traceback(monkeypatch, capsys):
     monkeypatch.delenv("GRINNING_CAT_API_KEY", raising=False)
 
-    assert cli.main(["--agent", "x", "--yes"]) == 2
+    assert cli.main(["--agent", "x", "--metadata", "label=test", "--yes"]) == 2
 
     assert "GRINNING_CAT_API_KEY" in capsys.readouterr().err
 
@@ -168,6 +168,45 @@ def test_empty_api_key_is_rejected(monkeypatch, capsys):
     assert cli._configuration() is None
 
     assert "GRINNING_CAT_API_KEY" in capsys.readouterr().err
+
+
+def test_patch_suffix_is_validated_before_the_api_key(monkeypatch, capsys):
+    """A non-YAML patch must name the format, not the missing key."""
+    monkeypatch.delenv("GRINNING_CAT_API_KEY", raising=False)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--agent", "x", "--patch", "/tmp/x.json"])
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "YAML" in err
+    assert "GRINNING_CAT_API_KEY" not in err
+
+
+def test_valid_patch_without_api_key_still_reports_the_key(monkeypatch, tmp_path, capsys):
+    """A valid dry-run must reach the key guard and never build a client."""
+    monkeypatch.delenv("GRINNING_CAT_API_KEY", raising=False)
+    patch_file = tmp_path / "patch.yml"
+    patch_file.write_text("llm:\n  openrouter:\n    temperature: 0.2\n", encoding="utf-8")
+
+    assert cli.main(["--agent", "x", "--patch", str(patch_file)]) == 2
+
+    assert "GRINNING_CAT_API_KEY" in capsys.readouterr().err
+
+
+def test_malformed_yaml_is_reported_before_the_api_key(monkeypatch, tmp_path, capsys):
+    """A YAML parse error must win over the missing key."""
+    monkeypatch.delenv("GRINNING_CAT_API_KEY", raising=False)
+    patch_file = tmp_path / "broken.yml"
+    patch_file.write_text("llm: [unclosed\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--agent", "x", "--patch", str(patch_file)])
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "invalid --patch" in err
+    assert "GRINNING_CAT_API_KEY" not in err
 
 
 class FakeEndpoint:
@@ -1826,7 +1865,7 @@ def test_shipped_full_agent_example_loads_through_load_patch():
     assert patches[("plugins", "my_plugin")] == {"options": {"enabled": True, "threshold": 0.7}}
     assert patches[("plugins", "other_plugin")] == {
         "api_key": "REPLACE-ME",
-        "http.timeout": {"seconds": 30},
+        "http": {"timeout": {"seconds": 30}},
     }
     assert active_plugins == {"my_plugin": True, "other_plugin": False}
 

@@ -210,6 +210,7 @@ Two ready-to-use YAML files ship in `examples/`; copy one, adapt the names and v
 - Scalars are not implicitly typed: `on` stays the string `on`, `0123` stays `"0123"`, `2024-01-01` stays a string; `1.10` becomes the number `1.1`.
 - One document per file: no `---` separators. Anchors and aliases are allowed.
 - `active_plugins` maps a plugin name to `on`/`off` and reconciles like `--plugin`.
+- Never commit a real key: prefer `--set llm:<cfg>:api_key=...`, an environment variable, or a patch file you do not commit.
 
 | File | What it shows |
 | --- | --- |

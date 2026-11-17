@@ -876,8 +876,8 @@ examples:
   uv run python scripts/batch_agent_update.py --agent corso --set llm:openrouter:model=anthropic/claude-3.5-sonnet
 
   # 2. Set api_key of an LLM configuration; any other key (temperature, base_url, ...) works the same way.
+  #    Prefer --set (or an env var, or a patch file you do not commit); never commit a real key.
   uv run python scripts/batch_agent_update.py --agent corso --set llm:openrouter:api_key=sk-...
-  #    For a secret that must not land in shell history, keep it in a patch file instead:
   uv run python scripts/batch_agent_update.py --agent corso --patch examples/patch-llm-openrouter.yml
 
   # 3. Add or overwrite an agent metadata key; --name is the shortcut for --metadata name=VALUE.
@@ -1030,12 +1030,9 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    # The real client needs credentials. Report a missing key before the usage
-    # checks so that an incomplete command line still names the real blocker;
-    # an injected factory (tests) skips the environment entirely.
-    if client_factory is default_client_factory and _configuration() is None:
-        return 2
-
+    # Validate the command line and every operation before credentials: a
+    # malformed patch must name the format error, not a missing key. --help and
+    # argparse usage errors therefore work without GRINNING_CAT_API_KEY.
     _validate(parser, args)
 
     if args.max_workers < 1:
@@ -1059,6 +1056,8 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
             parser.error(str(exc))
         operations = built_operations
 
+    # Only now build the client: the real one needs credentials, and an
+    # injected factory (tests) skips the environment entirely.
     client = client_factory()
     if client is None:
         return 2

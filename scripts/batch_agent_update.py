@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import sys
 import tempfile
 import threading
@@ -830,6 +831,121 @@ def _dump_filename(agent_id: str) -> str:
     return f"{safe_id}-{hashlib.sha1(agent_id.encode()).hexdigest()[:8]}.yml"
 
 
+def _write_dump_manifest(
+    directory: Path,
+    entries: list[dict[str, Any]],
+    argv: list[str],
+    host: str,
+    secret_policy: str,
+) -> None:
+    """Write ``manifest.yml`` atomically with one row per selected agent."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    ok = sum(1 for entry in entries if entry["ok"])
+    manifest = {
+        "format": "patch-v1",
+        "generated_at": _utc_now(),
+        "argv": list(argv),
+        "source_host": host,
+        "secret_policy": secret_policy,
+        "counts": {"selected": len(entries), "ok": ok, "failed": len(entries) - ok},
+        "agents": [
+            {
+                "agent_id": entry["agent_id"],
+                "role": entry["role"],
+                "file": entry["file"],
+                "categories": entry["categories"],
+                "selected": entry["selected"],
+                "plugins": entry["plugins"],
+                "warnings": entry["warnings"],
+            }
+            for entry in entries
+        ],
+    }
+    _atomic_write_text(
+        directory / "manifest.yml",
+        yaml.safe_dump(
+            manifest,
+            sort_keys=False,
+            default_flow_style=False,
+            allow_unicode=True,
+        ),
+    )
+
+
+def dump_configs(
+    client: Any,
+    selected: list[AgentOutput],
+    directory: Path,
+    categories: list[str],
+    include_secrets: bool,
+    argv: list[str],
+    max_workers: int,
+) -> dict[str, Any]:
+    """Dump every selected agent, isolating failures per agent.
+
+    A failed agent leaves no partial file behind; the other agents and the
+    manifest are still written.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    host = socket.gethostname()
+    secret_policy = "included" if include_secrets else "omitted"
+    argv = list(argv)
+
+    def run(agent: AgentOutput) -> dict[str, Any]:
+        role = _agent_role(agent.agent_id)
+        entry: dict[str, Any] = {
+            "agent_id": agent.agent_id,
+            "role": role,
+            "file": None,
+            "categories": list(categories),
+            "selected": {},
+            "plugins": 0,
+            "warnings": [],
+            "ok": True,
+            "reason": None,
+        }
+        try:
+            payload = _dump_agent_config(client, agent, categories, include_secrets)
+            entry["selected"] = {
+                category: next(iter(value))
+                for category, value in payload.items()
+                if category in FACTORY_LIST_GETTERS or category in SYSTEM_WIDE_CATEGORIES
+            }
+            entry["plugins"] = len(payload.get("plugins", {}))
+            header = _dump_header(
+                agent.agent_id,
+                role,
+                categories,
+                entry["selected"],
+                argv,
+                host,
+                secret_policy,
+                entry["warnings"],
+            )
+            filename = _dump_filename(agent.agent_id)
+            _atomic_write_text(directory / filename, _render_dump_yaml(payload, header))
+            entry["file"] = filename
+        except Exception as exc:  # noqa: BLE001 - one agent must not abort the dump
+            entry["ok"] = False
+            entry["reason"] = str(exc)
+        return entry
+
+    if max_workers > 1:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            entries = list(executor.map(run, selected))
+    else:
+        entries = [run(agent) for agent in selected]
+
+    _write_dump_manifest(directory, entries, argv, host, secret_policy)
+    ok = sum(1 for entry in entries if entry["ok"])
+    return {
+        "agents": entries,
+        "summary": {"selected": len(selected), "ok": ok, "failed": len(entries) - ok},
+    }
+
+
 def _run_agent(
     client: Any,
     agent: AgentOutput,
@@ -1050,6 +1166,25 @@ def _exit_code(envelope: dict[str, Any]) -> int:
     return 0
 
 
+def _report_dump(envelope: dict[str, Any], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(envelope, indent=2))
+        return
+    for entry in envelope["agents"]:
+        result = "ok" if entry["ok"] else "failed"
+        line = (
+            f"[dump] agent={entry['agent_id']} role={entry['role']} "
+            f"file={entry['file']} result={result}"
+        )
+        if not entry["ok"]:
+            line += f" reason={entry['reason']}"
+        print(line)
+
+
+def _dump_exit_code(envelope: dict[str, Any]) -> int:
+    return 0 if all(entry["ok"] for entry in envelope["agents"]) else 1
+
+
 _EXAMPLES = """\
 LLM configuration names: --llm and --set llm:<name> take the configuration name
 reported by GET /llm/settings (the JSON-schema title, i.e. the class name such as
@@ -1266,6 +1401,42 @@ def _validate(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None
         parser.error("--agent or --all is required")
 
 
+def _run_dump(args: argparse.Namespace, argv: list[str] | None, client_factory) -> int:
+    """Read the selected agents through the SDK and write the dump files."""
+    client = client_factory()
+    if client is None:
+        return 2
+    try:
+        agents = client.utils.get_agents()
+    except Exception as exc:  # noqa: BLE001 - CLI boundary: report the discovery failure
+        print(f"cannot list agents: {exc}", file=sys.stderr)
+        return 1
+    try:
+        selected = select_agents(
+            agents,
+            args.agent or [],
+            args.all,
+            args.exclude or [],
+            include_internal=True,
+        )
+    except SelectionError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    categories = list(args.dump_only) if args.dump_only else list(DUMP_CATEGORIES)
+    envelope = dump_configs(
+        client,
+        selected,
+        Path(args.dump),
+        categories,
+        args.dump_secrets,
+        list(argv) if argv is not None else sys.argv[1:],
+        args.max_workers,
+    )
+    _report_dump(envelope, args.json)
+    return _dump_exit_code(envelope)
+
+
 def main(argv: list[str] | None = None, client_factory=default_client_factory) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -1277,6 +1448,9 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
 
     if args.max_workers < 1:
         parser.error("--max-workers must be at least 1")
+
+    if args.dump:
+        return _run_dump(args, argv, client_factory)
 
     snapshots = None
     system_wide: list[Operation] = []

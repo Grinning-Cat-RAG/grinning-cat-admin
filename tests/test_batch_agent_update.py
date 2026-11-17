@@ -2332,3 +2332,174 @@ def test_atomic_write_text_leaves_no_partial_file_on_failure(tmp_path):
 def test_dump_filename_is_unique_for_colliding_safe_ids():
     assert cli._dump_filename("a/b") != cli._dump_filename("a_b")
     assert cli._dump_filename("corso").endswith(".yml")
+
+
+# --- Todo 5: manifest and dump orchestration -------------------------------
+
+
+def _full_factory_lists(agent_id):
+    values = {
+        "llm": ("LLMOpenRouterConfig", {"model": "m"}),
+        "chunking": ("Chunker", {"chunk_size": 100}),
+        "vector_database": ("VectorDB", {"host": "h"}),
+        "auth_handler": ("AuthHandler", {"mode": "x"}),
+        "agentic_workflow": ("Workflow", {"steps": 1}),
+        "context_retriever": ("Retriever", {"k": 3}),
+        "file_manager": ("FileManager", {"root": "/tmp"}),
+    }
+    lists = {}
+    for category, (attribute, _getter) in cli.FACTORY_LIST_GETTERS.items():
+        name, value = values[category]
+        lists[(attribute, agent_id)] = _factory_list(name, {name: value})
+    return lists
+
+
+def _system_factory_lists():
+    lists = _full_factory_lists("system")
+    lists[("embedder", None)] = _factory_list(
+        "OpenAIEmbedder", {"OpenAIEmbedder": {"api_key": "sk-1"}}
+    )
+    lists[("ingestion", None)] = _factory_list("Ingestion", {"Ingestion": {"batch": 10}})
+    return lists
+
+
+def _dump_body(path):
+    text = Path(path).read_text(encoding="utf-8")
+    return yaml.safe_load("\n".join(line for line in text.splitlines() if not line.startswith("#")))
+
+
+def test_dump_configs_writes_one_file_per_agent_and_a_manifest(tmp_path):
+    agents = [_agent("corso"), _agent("lab")]
+    lists = {**_full_factory_lists("corso"), **_full_factory_lists("lab")}
+    client = FakeClient(
+        agents=agents, factory_lists=lists, plugins={"corso": {"foo": True}, "lab": {}}
+    )
+
+    envelope = cli.dump_configs(
+        client, agents, tmp_path, cli.DUMP_CATEGORIES, False, ["--dump", str(tmp_path)], 1
+    )
+
+    files = sorted(path.name for path in tmp_path.glob("*.yml"))
+    assert files == sorted(
+        [cli._dump_filename("corso"), cli._dump_filename("lab"), "manifest.yml"]
+    )
+    manifest = yaml.safe_load((tmp_path / "manifest.yml").read_text(encoding="utf-8"))
+    assert manifest["format"] == "patch-v1"
+    assert manifest["secret_policy"] == "omitted"
+    assert {entry["agent_id"] for entry in manifest["agents"]} == {"corso", "lab"}
+    assert manifest["counts"] == {"selected": 2, "ok": 2, "failed": 0}
+    assert envelope["summary"] == {"selected": 2, "ok": 2, "failed": 0}
+    for agent_id in ("corso", "lab"):
+        patches, _active = cli.load_patch(str(tmp_path / cli._dump_filename(agent_id)))
+        assert ("llm", "LLMOpenRouterConfig") in patches
+
+
+def test_dump_configs_isolates_a_failing_agent(tmp_path):
+    agents = [_agent("corso"), _agent("lab")]
+    client = FakeClient(agents=agents, factory_lists=_full_factory_lists("corso"))
+
+    envelope = cli.dump_configs(
+        client, agents, tmp_path, cli.DUMP_CATEGORIES, False, [], 1
+    )
+
+    assert envelope["summary"] == {"selected": 2, "ok": 1, "failed": 1}
+    assert (tmp_path / cli._dump_filename("corso")).exists()
+    assert not (tmp_path / cli._dump_filename("lab")).exists()
+    failed = next(entry for entry in envelope["agents"] if entry["agent_id"] == "lab")
+    assert failed["ok"] is False
+    assert failed["file"] is None
+    assert failed["reason"]
+
+
+def test_dump_manifest_is_0600(tmp_path):
+    agents = [_agent("corso")]
+    client = FakeClient(agents=agents, factory_lists=_full_factory_lists("corso"))
+
+    cli.dump_configs(client, agents, tmp_path, cli.DUMP_CATEGORIES, False, [], 1)
+
+    assert (tmp_path / "manifest.yml").stat().st_mode & 0o777 == 0o600
+    assert (tmp_path / cli._dump_filename("corso")).stat().st_mode & 0o777 == 0o600
+
+
+def test_dump_configs_max_workers_matches_sequential(tmp_path):
+    agents = [_agent("corso"), _agent("lab")]
+    lists = {**_full_factory_lists("corso"), **_full_factory_lists("lab")}
+
+    sequential = tmp_path / "sequential"
+    parallel = tmp_path / "parallel"
+    cli.dump_configs(
+        FakeClient(agents=agents, factory_lists=lists), agents, sequential, cli.DUMP_CATEGORIES, False, [], 1
+    )
+    cli.dump_configs(
+        FakeClient(agents=agents, factory_lists=lists), agents, parallel, cli.DUMP_CATEGORIES, False, [], 4
+    )
+
+    for agent_id in ("corso", "lab"):
+        assert _dump_body(sequential / cli._dump_filename(agent_id)) == _dump_body(
+            parallel / cli._dump_filename(agent_id)
+        )
+
+
+def test_main_dump_writes_files_and_reports(tmp_path, capsys):
+    agents = [_agent("corso")]
+    client = FakeClient(agents=agents, factory_lists=_full_factory_lists("corso"))
+
+    rc = cli.main(["--dump", str(tmp_path), "--all"], client_factory=lambda: client)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "[dump] agent=corso role=agent file=" in out
+    assert "result=ok" in out
+
+
+def test_main_dump_failure_exits_1(tmp_path, capsys):
+    agents = [_agent("corso")]
+    client = FakeClient(agents=agents)
+
+    rc = cli.main(["--dump", str(tmp_path), "--all"], client_factory=lambda: client)
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "result=failed" in out
+    assert "reason=" in out
+
+
+def test_main_dump_json_envelope(tmp_path, capsys):
+    agents = [_agent("corso")]
+    client = FakeClient(agents=agents, factory_lists=_full_factory_lists("corso"))
+
+    rc = cli.main(["--dump", str(tmp_path), "--all", "--json"], client_factory=lambda: client)
+
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["summary"] == {"selected": 1, "ok": 1, "failed": 0}
+    assert data["agents"][0]["agent_id"] == "corso"
+
+
+def test_main_dump_all_includes_system_and_widgets(tmp_path):
+    agents = [_agent("system"), _agent("__w"), _agent("corso")]
+    lists = {
+        **_system_factory_lists(),
+        **_full_factory_lists("__w"),
+        **_full_factory_lists("corso"),
+    }
+    client = FakeClient(agents=agents, factory_lists=lists)
+
+    rc = cli.main(["--dump", str(tmp_path), "--all"], client_factory=lambda: client)
+
+    assert rc == 0
+    manifest = yaml.safe_load((tmp_path / "manifest.yml").read_text(encoding="utf-8"))
+    roles = {entry["agent_id"]: entry["role"] for entry in manifest["agents"]}
+    assert roles == {"system": "system", "__w": "widget", "corso": "agent"}
+
+
+def test_main_dump_system_includes_embedder_and_ingestion(tmp_path):
+    agents = [_agent("system")]
+    client = FakeClient(agents=agents, factory_lists=_system_factory_lists())
+
+    rc = cli.main(["--dump", str(tmp_path), "--agent", "system"], client_factory=lambda: client)
+
+    assert rc == 0
+    payload = _dump_body(tmp_path / cli._dump_filename("system"))
+    assert "embedder" in payload
+    assert "ingestion" in payload

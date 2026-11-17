@@ -53,6 +53,10 @@ class SelectionError(ValueError):
     """The requested agent selection cannot be satisfied."""
 
 
+class SystemWideError(ValueError):
+    """A system-wide category was requested without ``--allow-system-wide``."""
+
+
 def select_agents(
     agents: list[AgentOutput],
     substrings: list[str],
@@ -444,7 +448,7 @@ def _validate_categories(
     for category, _name in patches:
         if category in SYSTEM_WIDE_CATEGORIES:
             if not allow_system_wide:
-                raise ValueError(
+                raise SystemWideError(
                     f"{category} is system-wide: it re-embeds every agent; "
                     "pass --allow-system-wide to apply it"
                 )
@@ -452,6 +456,38 @@ def _validate_categories(
         if category not in VALID_CATEGORIES:
             valid = ", ".join(sorted(VALID_CATEGORIES))
             raise ValueError(f"unknown category {category!r}; valid categories: {valid}")
+
+
+def _assemble_operations(
+    patches: dict[tuple[str, str], dict[str, Any]],
+    metadata_payload: dict[str, Any],
+    llm_operations: list[Operation],
+    plugin_operations: list[Operation],
+    allow_system_wide: bool,
+) -> tuple[list[Operation], list[Operation]]:
+    """Build the ordered per-agent and system-wide operations.
+
+    The order is metadata, LLM, plugins, settings; system-wide categories are
+    split out so they run once for the whole deployment. ``metadata_payload``
+    is only emitted when non-empty, so a dump with ``metadata: {}`` produces
+    no metadata operation.
+    """
+    _validate_categories(patches, allow_system_wide)
+
+    operations = []
+    system_wide = []
+    if metadata_payload:
+        operations.append(Operation(kind="metadata", name="", payload=metadata_payload))
+    operations.extend(llm_operations)
+    operations.extend(plugin_operations)
+    for (category, name), patch in patches.items():
+        if category == "metadata":
+            continue
+        if category in SYSTEM_WIDE_CATEGORIES:
+            system_wide.append(Operation(kind="system", category=category, name=name, payload=patch))
+            continue
+        operations.append(Operation(kind="settings", category=category, name=name, payload=patch))
+    return operations, system_wide
 
 
 def _build_operations(args: argparse.Namespace) -> tuple[list[Operation], list[Operation]]:
@@ -472,30 +508,23 @@ def _build_operations(args: argparse.Namespace) -> tuple[list[Operation], list[O
     if args.name is not None:
         metadata_payload["name"] = args.name
 
-    _validate_categories(patches, args.allow_system_wide)
-
-    operations = []
-    system_wide = []
-    if metadata_payload:
-        operations.append(Operation(kind="metadata", name="", payload=metadata_payload))
-    for model, patch in parse_llm(args.llm or []):
-        operations.append(Operation(kind="llm", name=model, payload=patch))
+    llm_operations = [
+        Operation(kind="llm", name=model, payload=patch)
+        for model, patch in parse_llm(args.llm or [])
+    ]
     cli_plugins = parse_plugins(args.plugin or [])
-    for name, desired in cli_plugins:
-        operations.append(Operation(kind="plugin", name=name, payload=desired))
+    plugin_operations = [
+        Operation(kind="plugin", name=name, payload=desired) for name, desired in cli_plugins
+    ]
     # An explicit --plugin WINS over the same name in the patch file.
     cli_plugin_names = {name for name, _desired in cli_plugins}
     for name, desired in file_plugins.items():
         if name not in cli_plugin_names:
-            operations.append(Operation(kind="plugin", name=name, payload=desired))
-    for (category, name), patch in patches.items():
-        if category == "metadata":
-            continue
-        if category in SYSTEM_WIDE_CATEGORIES:
-            system_wide.append(Operation(kind="system", category=category, name=name, payload=patch))
-            continue
-        operations.append(Operation(kind="settings", category=category, name=name, payload=patch))
-    return operations, system_wide
+            plugin_operations.append(Operation(kind="plugin", name=name, payload=desired))
+
+    return _assemble_operations(
+        patches, metadata_payload, llm_operations, plugin_operations, args.allow_system_wide
+    )
 
 
 def update_metadata(
@@ -1296,14 +1325,16 @@ def execute_batch(
     max_workers: int = 1,
     missing: set[str] | None = None,
     create: set[str] | None = None,
+    system_wide_first: bool = False,
 ) -> dict[str, Any]:
     """Apply every operation, isolating failures per agent and per operation.
 
     ``operations`` is either one list applied to every agent or a per-agent
     mapping (used by ``--restore``). System-wide operations run exactly once,
-    after the per-agent loop. Agents in ``create`` are created first; a failed
-    creation fails only that agent. ``missing`` keeps its restore semantics
-    unless the same agent is also in ``create``.
+    after the per-agent loop unless ``system_wide_first`` is set (the reload
+    path configures embedder/ingestion before the agents). Agents in ``create``
+    are created first; a failed creation fails only that agent. ``missing``
+    keeps its restore semantics unless the same agent is also in ``create``.
     """
     argv = list(argv or [])
     if isinstance(operations, dict):
@@ -1348,22 +1379,32 @@ def execute_batch(
             }
         return _run_agent(client, agent, ordered_for(agent), snapshot_dir, argv, created=created)
 
+    system_results = []
+
+    def run_system_wide() -> None:
+        for operation in system_wide or []:
+            try:
+                detail = _apply_system_wide(client, operation)
+            except Exception as exc:  # noqa: BLE001 - one system-wide op must not abort the run
+                system_results.append(
+                    {"op": _operation_label(operation), "status": "failed", "detail": str(exc)}
+                )
+            else:
+                system_results.append(
+                    {"op": _operation_label(operation), "status": "ok", "detail": detail}
+                )
+
+    if system_wide_first:
+        run_system_wide()
+
     if max_workers > 1:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             results = list(executor.map(run, selected))
     else:
         results = [run(agent) for agent in selected]
 
-    system_results = []
-    for operation in system_wide or []:
-        try:
-            detail = _apply_system_wide(client, operation)
-        except Exception as exc:  # noqa: BLE001 - one system-wide op must not abort the run
-            system_results.append(
-                {"op": _operation_label(operation), "status": "failed", "detail": str(exc)}
-            )
-        else:
-            system_results.append({"op": _operation_label(operation), "status": "ok", "detail": detail})
+    if not system_wide_first:
+        run_system_wide()
 
     ok = sum(1 for result in results if result["ok"])
     skipped = sum(
@@ -1607,6 +1648,15 @@ examples:
   #    --create-missing only applies to --agent substrings that match nothing; --all never creates.
   uv run python scripts/batch_agent_update.py --agent nuovo --create-missing --patch examples/patch-full-agent.yml
 
+  # 9. Reload a whole dump directory: every file goes to its own agent, and a
+  #    missing agent is created first. The system entry is applied first.
+  uv run python scripts/batch_agent_update.py --reload-dir ./dump --allow-system-wide
+  #    Migration recipe: dump, reload, copy data/storage, then reindex.
+  uv run python scripts/batch_agent_update.py --dump ./dump --all --dump-secrets
+  uv run python scripts/batch_agent_update.py --reload-dir ./dump --allow-system-wide --yes
+  #    System reload caveat: some cores have no per-agent system routes, so the
+  #    per-agent system operations fail in isolation; the system-wide ones still run.
+
   # Safety: dry-run is the default; --yes writes; exit codes 0 = ok, 1 = failure, 2 = dry-run/abort.
 """
 
@@ -1695,6 +1745,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="restore a snapshot file or directory",
     )
     parser.add_argument(
+        "--reload-dir",
+        metavar="DIR",
+        help="apply every dump file in DIR to its own agent, creating missing agents",
+    )
+    parser.add_argument(
         "--allow-system-wide",
         action="store_true",
         help="allow system-wide categories such as embedder",
@@ -1737,6 +1792,39 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _validate(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """Reject impossible command lines before any client is built."""
+    if args.reload_dir:
+        conflicting = []
+        if args.agent:
+            conflicting.append("agent")
+        if args.all:
+            conflicting.append("all")
+        if args.exclude:
+            conflicting.append("exclude")
+        conflicting.extend(flag for flag in OPERATION_FLAGS if getattr(args, flag))
+        for name in (
+            "restore",
+            "create_missing",
+            "dump",
+            "diff",
+            "dump_only",
+            "dump_secrets",
+            "dump_manifest_only",
+        ):
+            if getattr(args, name):
+                conflicting.append(name)
+        if conflicting:
+            parser.error(
+                f"--reload-dir cannot be combined with --{conflicting[0].replace('_', '-')}"
+            )
+        if not Path(args.reload_dir).is_dir():
+            parser.error(f"--reload-dir requires an existing directory: {args.reload_dir!r}")
+        return
+
+    if args.create_missing and any(
+        substring.strip().lower() == "system" for substring in (args.agent or [])
+    ):
+        parser.error("the system agent cannot be created")
+
     if args.create_missing:
         if args.all:
             parser.error("--create-missing cannot be combined with --all")
@@ -1866,6 +1954,288 @@ def _run_dump(
     return _dump_exit_code(envelope)
 
 
+def _reload_entries(directory: Path) -> list[dict[str, Any]]:
+    """Read the reload plan from ``manifest.yml`` or from the file headers.
+
+    Each entry is ``{"agent_id", "file", "error"}``. A manifest entry with
+    ``file: null`` is an error (a manifest-only dump has no per-agent file),
+    but it never aborts the other entries. Without a manifest, every
+    ``*.yml``/``*.yaml`` file is scanned for its ``# agent-id:`` header.
+    """
+    directory = Path(directory)
+    if not directory.is_dir():
+        raise ValueError(f"--reload-dir requires an existing directory: {str(directory)!r}")
+
+    manifest_path = directory / "manifest.yml"
+    if manifest_path.exists():
+        try:
+            manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError) as exc:
+            raise ValueError(f"cannot read {str(manifest_path)!r}: {exc}") from None
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("agents"), list):
+            raise ValueError(f"invalid manifest {str(manifest_path)!r}: missing agents list")
+        entries: list[dict[str, Any]] = []
+        for item in manifest["agents"]:
+            if not isinstance(item, dict):
+                entries.append(
+                    {"agent_id": None, "file": None, "error": "manifest entry is not a mapping"}
+                )
+                continue
+            agent_id = item.get("agent_id")
+            file = item.get("file")
+            if not agent_id or not isinstance(agent_id, str):
+                entries.append(
+                    {"agent_id": None, "file": file, "error": "manifest entry has no agent_id"}
+                )
+                continue
+            if not file:
+                entries.append(
+                    {
+                        "agent_id": agent_id,
+                        "file": None,
+                        "error": "manifest-only dump has no per-agent file",
+                    }
+                )
+                continue
+            if not isinstance(file, str):
+                entries.append(
+                    {
+                        "agent_id": agent_id,
+                        "file": None,
+                        "error": "manifest entry file must be a string",
+                    }
+                )
+                continue
+            entries.append({"agent_id": agent_id, "file": file, "error": None})
+        if not entries:
+            raise ValueError(f"no agents found in {str(manifest_path)!r}")
+        return entries
+
+    files = sorted(
+        path
+        for path in [*directory.glob("*.yml"), *directory.glob("*.yaml")]
+        if path.name not in ("manifest.yml", "manifest.yaml") and not path.name.startswith(".")
+    )
+    if not files:
+        raise ValueError(f"no dump files found in {str(directory)!r}")
+
+    entries = []
+    for path in files:
+        try:
+            agent_id, _body = _read_dump_file(path)
+        except OSError as exc:
+            entries.append(
+                {"agent_id": None, "file": path.name, "error": f"cannot read {str(path)!r}: {exc}"}
+            )
+            continue
+        if not agent_id:
+            entries.append(
+                {"agent_id": None, "file": path.name, "error": "no '# agent-id:' header"}
+            )
+            continue
+        entries.append({"agent_id": agent_id, "file": path.name, "error": None})
+    return entries
+
+
+def _reload_label(entry: dict[str, Any]) -> str:
+    """A stable label for a reload entry, even when it has no agent id."""
+    if entry.get("agent_id"):
+        return entry["agent_id"]
+    if entry.get("file"):
+        return Path(entry["file"]).name
+    return "manifest"
+
+
+def _reload_file_label(entry: dict[str, Any]) -> str:
+    """The file (or manifest) a reload entry came from."""
+    return entry.get("file") or _reload_label(entry)
+
+
+def _build_reload_plan(
+    directory: Path, allow_system_wide: bool
+) -> tuple[list[dict[str, Any]], dict[str, list[Operation]], list[Operation]]:
+    """Load every dump file and build per-agent plus system-wide operations.
+
+    A broken or missing file fails only its own entry. A system-wide category
+    without ``--allow-system-wide`` aborts the whole run before any write.
+    Entries are ordered with ``system`` first, then in manifest/file order.
+    """
+    entries = _reload_entries(directory)
+    operations: dict[str, list[Operation]] = {}
+    system_wide: dict[tuple[str, str], Operation] = {}
+    for entry in entries:
+        if entry["error"]:
+            continue
+        path = Path(directory) / entry["file"]
+        try:
+            patches, file_plugins = load_patch(str(path))
+            metadata_payload: dict[str, Any] = {}
+            for (category, _name), patch in patches.items():
+                if category == "metadata":
+                    metadata_payload = _deep_merge(metadata_payload, patch)
+            plugin_operations = [
+                Operation(kind="plugin", name=name, payload=desired)
+                for name, desired in file_plugins.items()
+            ]
+            per_agent, entry_system_wide = _assemble_operations(
+                patches, metadata_payload, [], plugin_operations, allow_system_wide
+            )
+        except SystemWideError:
+            raise
+        except ValueError as exc:
+            entry["error"] = str(exc)
+            continue
+        if entry["agent_id"] in operations:
+            entry["error"] = (
+                f"duplicate agent id {entry['agent_id']!r} in {entry['file']!r}"
+            )
+            continue
+        operations[entry["agent_id"]] = per_agent
+        for operation in entry_system_wide:
+            system_wide[(operation.category, operation.name)] = operation
+
+    entries.sort(key=lambda entry: 0 if entry["agent_id"] == "system" else 1)
+    return entries, operations, list(system_wide.values())
+
+
+def _reload_plan_agents(
+    selected: list[AgentOutput],
+    operations: dict[str, list[Operation]],
+    create_ids: set[str],
+) -> list[dict[str, Any]]:
+    """The dry-run plan rows, one per selected agent."""
+    plan = []
+    for agent in selected:
+        agent_operations = operations[agent.agent_id]
+        labels = [_operation_label(operation) for operation in agent_operations]
+        if agent.agent_id in create_ids:
+            labels = ["create", *labels]
+        metadata_keys = sorted(
+            key
+            for operation in agent_operations
+            if operation.kind == "metadata"
+            for key in operation.payload
+        )
+        plan.append(
+            {"agent": agent.agent_id, "ops": labels, "metadata_keys": metadata_keys}
+        )
+    return plan
+
+
+def _run_reload_dir(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    argv: list[str] | None,
+    client_factory,
+) -> int:
+    """Apply every dump file in ``--reload-dir`` to its own agent."""
+    try:
+        entries, operations, system_wide = _build_reload_plan(
+            Path(args.reload_dir), args.allow_system_wide
+        )
+    except SystemWideError as exc:
+        parser.error(str(exc))
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    broken = [entry for entry in entries if entry["error"]]
+    valid = [entry for entry in entries if not entry["error"]]
+    if not valid:
+        for entry in broken:
+            print(
+                f"[reload] file={_reload_file_label(entry)} error={entry['error']}",
+                file=sys.stderr,
+            )
+        return 2 if not args.yes else 1
+
+    client = client_factory()
+    if client is None:
+        return 2
+    try:
+        agents = client.utils.get_agents()
+    except Exception as exc:  # noqa: BLE001 - CLI boundary: report the discovery failure
+        print(f"cannot list agents: {exc}", file=sys.stderr)
+        return 1
+
+    existing = {agent.agent_id: agent for agent in agents}
+    selected: list[AgentOutput] = []
+    create_ids: set[str] = set()
+    for entry in valid:
+        agent_id = entry["agent_id"]
+        if agent_id == "system":
+            selected.append(AgentOutput(agent_id="system", metadata={}))
+        elif agent_id in existing:
+            selected.append(existing[agent_id])
+        else:
+            selected.append(AgentOutput(agent_id=agent_id, metadata={}))
+            create_ids.add(agent_id)
+
+    if not args.yes:
+        plan_agents = _reload_plan_agents(selected, operations, create_ids)
+        if args.yaml:
+            plan: dict[str, Any] = {
+                "dry_run": True,
+                "agents": plan_agents,
+                "system_wide": [
+                    {"op": _operation_label(operation)} for operation in system_wide
+                ],
+            }
+            if broken:
+                plan["errors"] = [
+                    {"file": entry["file"], "error": entry["error"]} for entry in broken
+                ]
+            print(
+                yaml.dump(
+                    plan,
+                    Dumper=_PlainSafeDumper,
+                    sort_keys=False,
+                    default_flow_style=False,
+                    allow_unicode=True,
+                ),
+                end="",
+            )
+        else:
+            for row in plan_agents:
+                print(
+                    f"agent={row['agent']} ops={','.join(row['ops'])} "
+                    f"metadata_keys={','.join(row['metadata_keys'])}"
+                )
+            print(f"system-wide: {len(system_wide)}")
+        for entry in broken:
+            print(
+                f"[reload] file={_reload_file_label(entry)} error={entry['error']}",
+                file=sys.stderr,
+            )
+        print("dry-run: no changes written (pass --yes to apply)", file=sys.stderr)
+        return 2
+
+    backup_dir = Path(args.backup_out) if args.backup_out else _default_backup_dir()
+    envelope = execute_batch(
+        client,
+        selected,
+        operations,
+        system_wide=system_wide,
+        snapshot_dir=backup_dir,
+        argv=list(argv) if argv is not None else sys.argv[1:],
+        max_workers=args.max_workers,
+        create=create_ids or None,
+        system_wide_first=True,
+    )
+    for entry in broken:
+        envelope["agents"].append(
+            {
+                "agent_id": _reload_label(entry),
+                "ok": False,
+                "ops": [],
+                "error": f"{_reload_file_label(entry)}: {entry['error']}",
+            }
+        )
+    envelope["summary"]["selected"] += len(broken)
+    envelope["summary"]["failed"] += len(broken)
+    _report(envelope, args.yaml)
+    return _exit_code(envelope)
+
+
 def main(argv: list[str] | None = None, client_factory=default_client_factory) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -1877,6 +2247,9 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
 
     if args.max_workers < 1:
         parser.error("--max-workers must be at least 1")
+
+    if args.reload_dir:
+        return _run_reload_dir(parser, args, argv, client_factory)
 
     if args.dump:
         return _run_dump(parser, args, argv, client_factory)
@@ -1910,6 +2283,10 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
     except Exception as exc:  # noqa: BLE001 - CLI boundary: report the discovery failure instead of a traceback
         print(f"cannot list agents: {exc}", file=sys.stderr)
         return 1
+
+    # The SDK list never contains the system agent, but the update path must
+    # be able to select it (--agent system). --all still filters it out.
+    agents = _ensure_system_agent(agents)
 
     missing: set[str] | None = None
     created_ids: list[str] = []

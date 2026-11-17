@@ -132,6 +132,7 @@ GRINNING_CAT_API_SECURE_CONNECTION=false
 | `--yaml` | print the result as YAML |
 | `--backup-out DIR` | directory for the YAML before-snapshot |
 | `--restore PATH` | restore a YAML snapshot file or directory |
+| `--reload-dir DIR` | apply every dump file in `DIR` to its own agent, creating missing agents |
 | `--allow-system-wide` | allow system-wide categories such as embedder |
 | `--max-workers INT` | parallel workers, one task per agent (default: 1) |
 
@@ -263,6 +264,29 @@ uv run python scripts/batch_agent_update.py --agent corso --patch ./dump/corso-1
 ```
 
 Reloading a `system` dump that contains `embedder` or `ingestion` requires `--allow-system-wide`, because those settings re-embed every agent.
+
+The `system` agent is selectable in the update path too, even though `GET /utils/agents/` never returns it: `--agent system` (or any substring matching it) selects a synthetic system agent, while `--all` still excludes it. `--create-missing --agent system` is rejected, because the core does not allow creating the system agent. On cores where the per-agent system routes answer 500/404, the per-agent operations fail in isolation and the system-wide operations still run.
+
+#### Reload a whole dump directory
+
+`--reload-dir DIR` applies every dump file in `DIR` to its own agent. It reads `DIR/manifest.yml` when present (`agents: [{agent_id, role, file, ...}]`); a `file: null` entry is an error, because a manifest-only dump has no per-agent file. Without a manifest it scans `*.yml`/`*.yaml` (skipping `manifest.yml`) and reads each file's `# agent-id:` header. The `system` entry is applied first, then the manifest order. An agent that does not exist is created before its operations are applied; a broken or missing file fails only its own entry.
+
+`--reload-dir` is exclusive with `--agent`, `--all`, `--exclude`, every operation flag (`--llm`, `--plugin`, `--metadata`, `--name`, `--set`, `--patch`), `--restore`, `--create-missing` and the dump flags. `--max-workers`, `--backup-out`, `--yes`, `--yaml` and `--allow-system-wide` are allowed. It is a dry run unless you pass `--yes`; the dry-run plan marks every missing agent with `create`.
+
+Migration recipe:
+
+```bash
+# 1. Dump every agent, including system and the __* widgets, with secrets.
+uv run python scripts/batch_agent_update.py --dump ./dump --all --dump-secrets
+# 2. Reload the whole directory on the target core (dry-run first, then --yes).
+uv run python scripts/batch_agent_update.py --reload-dir ./dump --allow-system-wide
+uv run python scripts/batch_agent_update.py --reload-dir ./dump --allow-system-wide --yes
+# 3. Copy the file storage and reindex the ingestion.
+cp -a data/storage /target/data/storage
+uv run python scripts/reindex_ingestion.py --all --yes
+```
+
+System reload caveat: some cores do not expose the per-agent system routes, so the per-agent operations of the `system` entry fail in isolation (exit 1) while the system-wide `embedder`/`ingestion` operations still run. Pass `--allow-system-wide` whenever the dump contains those categories.
 
 `--diff` compares an existing dump with the live configuration and never writes: it exits 0 when the dump matches and 1 when it differs.
 

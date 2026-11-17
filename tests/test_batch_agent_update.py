@@ -67,6 +67,7 @@ def test_help_lists_every_flag(capsys):
         "--restore",
         "--allow-system-wide",
         "--max-workers",
+        "--reload-dir",
     ):
         assert flag in out
 
@@ -3296,13 +3297,15 @@ def test_main_dump_all_includes_the_synthesized_system_agent(tmp_path):
     assert roles == {"corso": "agent", "system": "system"}
 
 
-def test_update_path_never_synthesizes_the_system_agent(capsys):
+def test_update_path_selects_the_synthesized_system_agent(capsys):
     client = FakeClient(agents=[_agent("corso")])
 
-    rc = cli.main(["--agent", "system", "--llm", "gpt-4={}"], client_factory=lambda: client)
+    rc = cli.main(["--agent", "system", "--metadata", "label=qa"], client_factory=lambda: client)
 
     assert rc == 2
-    assert "no agent id contains 'system'" in capsys.readouterr().err
+    out = capsys.readouterr().out
+    assert "agent=system ops=metadata metadata_keys=label" in out
+    assert client.calls_to("put_agent") == []
 
 
 def test_dump_agent_config_skips_inactive_plugin_settings():
@@ -3687,3 +3690,447 @@ def test_restore_dry_run_marks_missing_agents_for_creation(tmp_path, capsys):
     assert rc == 2
     assert "agent=corso1 ops=create,restore" in capsys.readouterr().out
     assert gone.calls_to("post_agent_create") == []
+
+
+# --- Reload a dump directory and restore the system agent ------------------
+
+
+def _reload_dump(directory, agent_id, payload):
+    """Write one dump file with the real ``# agent-id:`` header."""
+    path = Path(directory) / cli._dump_filename(agent_id)
+    header = cli._dump_header(
+        agent_id,
+        cli._agent_role(agent_id),
+        list(payload),
+        {},
+        [],
+        "host",
+        "omitted",
+        [],
+    )
+    path.write_text(cli._render_dump_yaml(payload, header), encoding="utf-8")
+    return path
+
+
+def _reload_manifest(directory, entries):
+    manifest = {"format": "patch-v1", "agents": entries}
+    (Path(directory) / "manifest.yml").write_text(
+        yaml.dump(manifest, Dumper=cli._PlainSafeDumper, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
+def test_reload_dir_creates_missing_agents_and_applies_each_file(tmp_path, capsys):
+    dump = tmp_path / "dump"
+    dump.mkdir()
+    corso = _reload_dump(dump, "corso1", {"metadata": {"label": "prod"}})
+    nuovo = _reload_dump(dump, "nuovo", {"metadata": {"label": "qa"}})
+    _reload_manifest(
+        dump,
+        [
+            {"agent_id": "corso1", "role": "agent", "file": corso.name},
+            {"agent_id": "nuovo", "role": "agent", "file": nuovo.name},
+        ],
+    )
+    client = FakeClient(agents=[_agent("corso1", {"name": "C"})])
+
+    rc = cli.main(
+        [
+            "--reload-dir",
+            str(dump),
+            "--yes",
+            "--backup-out",
+            str(tmp_path / "backup"),
+            "--yaml",
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert client.calls_to("post_agent_create") == [("nuovo", {})]
+    assert client.calls_to("put_agent") == [
+        ("corso1", {"name": "C", "label": "prod"}),
+        ("nuovo", {"label": "qa"}),
+    ]
+    payload = yaml.safe_load(capsys.readouterr().out)
+    by_id = {entry["agent_id"]: entry for entry in payload["agents"]}
+    assert by_id["corso1"]["ok"] is True
+    assert by_id["nuovo"]["created"] is True
+    snapshots = _snapshot_files(tmp_path / "backup")
+    assert len(snapshots) == 1
+    assert "corso1" in snapshots[0].name
+
+
+def test_reload_dir_falls_back_to_agent_id_headers(tmp_path, capsys):
+    dump = tmp_path / "dump"
+    dump.mkdir()
+    _reload_dump(dump, "corso1", {"metadata": {"label": "prod"}})
+    _reload_dump(dump, "nuovo", {"metadata": {"label": "qa"}})
+    client = FakeClient(agents=[_agent("corso1")])
+
+    rc = cli.main(["--reload-dir", str(dump), "--yaml"], client_factory=lambda: client)
+
+    assert rc == 2
+    payload = yaml.safe_load(capsys.readouterr().out)
+    assert [entry["agent"] for entry in payload["agents"]] == ["corso1", "nuovo"]
+    assert payload["agents"][1]["ops"] == ["create", "metadata"]
+    assert client.calls_to("post_agent_create") == []
+
+
+def test_reload_dir_applies_system_first_and_system_wide_once(tmp_path, capsys):
+    dump = tmp_path / "dump"
+    dump.mkdir()
+    corso = _reload_dump(dump, "corso1", {"metadata": {"label": "prod"}})
+    system = _reload_dump(
+        dump,
+        "system",
+        {
+            "metadata": {"name": "S"},
+            "embedder": {"OpenAIEmbedder": {"model": "e"}},
+            "ingestion": {"Ingestion": {"batch": 10}},
+        },
+    )
+    _reload_manifest(
+        dump,
+        [
+            {"agent_id": "corso1", "role": "agent", "file": corso.name},
+            {"agent_id": "system", "role": "system", "file": system.name},
+        ],
+    )
+    client = FakeClient(
+        agents=[_agent("corso1")],
+        settings={
+            ("embedder", "OpenAIEmbedder"): {"model": "old"},
+            ("ingestion", "Ingestion"): {"batch": 1},
+        },
+    )
+
+    rc = cli.main(
+        [
+            "--reload-dir",
+            str(dump),
+            "--allow-system-wide",
+            "--yes",
+            "--backup-out",
+            str(tmp_path / "backup"),
+            "--yaml",
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert client.calls_to("put_embedder_settings") == [("OpenAIEmbedder", {"model": "e"})]
+    assert client.calls_to("put_ingestion_settings") == [("Ingestion", {"batch": 10})]
+    names = [name for name, _args in client.calls]
+    assert names.index("put_embedder_settings") < names.index("put_agent")
+    assert client.calls_to("put_agent") == [
+        ("system", {"name": "S"}),
+        ("corso1", {"label": "prod"}),
+    ]
+
+
+def test_reload_dir_manifest_only_entry_is_an_isolated_error(tmp_path, capsys):
+    dump = tmp_path / "dump"
+    dump.mkdir()
+    corso = _reload_dump(dump, "corso1", {"metadata": {"label": "prod"}})
+    _reload_manifest(
+        dump,
+        [
+            {"agent_id": "corso1", "role": "agent", "file": corso.name},
+            {"agent_id": "manifest-only", "role": "agent", "file": None},
+        ],
+    )
+    client = FakeClient(agents=[_agent("corso1")])
+
+    rc = cli.main(
+        [
+            "--reload-dir",
+            str(dump),
+            "--yes",
+            "--backup-out",
+            str(tmp_path / "backup"),
+            "--yaml",
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 1
+    payload = yaml.safe_load(capsys.readouterr().out)
+    by_id = {entry["agent_id"]: entry for entry in payload["agents"]}
+    assert by_id["corso1"]["ok"] is True
+    assert by_id["manifest-only"]["ok"] is False
+    assert "manifest-only dump has no per-agent file" in by_id["manifest-only"]["error"]
+    assert client.calls_to("put_agent") == [("corso1", {"label": "prod"})]
+
+
+def test_reload_dir_isolates_a_broken_file(tmp_path, capsys):
+    dump = tmp_path / "dump"
+    dump.mkdir()
+    corso = _reload_dump(dump, "corso1", {"metadata": {"label": "prod"}})
+    broken = dump / "broken.yml"
+    broken.write_text("# agent-id: broken\nllm: [unclosed\n", encoding="utf-8")
+    _reload_manifest(
+        dump,
+        [
+            {"agent_id": "corso1", "role": "agent", "file": corso.name},
+            {"agent_id": "broken", "role": "agent", "file": broken.name},
+        ],
+    )
+    client = FakeClient(agents=[_agent("corso1")])
+
+    rc = cli.main(
+        [
+            "--reload-dir",
+            str(dump),
+            "--yes",
+            "--backup-out",
+            str(tmp_path / "backup"),
+            "--yaml",
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 1
+    payload = yaml.safe_load(capsys.readouterr().out)
+    by_id = {entry["agent_id"]: entry for entry in payload["agents"]}
+    assert by_id["corso1"]["ok"] is True
+    assert by_id["broken"]["ok"] is False
+    assert "invalid --patch" in by_id["broken"]["error"]
+    assert client.calls_to("put_agent") == [("corso1", {"label": "prod"})]
+
+
+def test_reload_dir_missing_file_is_an_isolated_error(tmp_path, capsys):
+    dump = tmp_path / "dump"
+    dump.mkdir()
+    corso = _reload_dump(dump, "corso1", {"metadata": {"label": "prod"}})
+    _reload_manifest(
+        dump,
+        [
+            {"agent_id": "corso1", "role": "agent", "file": corso.name},
+            {"agent_id": "gone", "role": "agent", "file": "gone.yml"},
+        ],
+    )
+    client = FakeClient(agents=[_agent("corso1")])
+
+    rc = cli.main(
+        [
+            "--reload-dir",
+            str(dump),
+            "--yes",
+            "--backup-out",
+            str(tmp_path / "backup"),
+            "--yaml",
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 1
+    payload = yaml.safe_load(capsys.readouterr().out)
+    by_id = {entry["agent_id"]: entry for entry in payload["agents"]}
+    assert by_id["gone"]["ok"] is False
+    assert "cannot read" in by_id["gone"]["error"]
+
+
+def test_reload_dir_fallback_reports_a_file_without_an_agent_id_header(tmp_path, capsys):
+    dump = tmp_path / "dump"
+    dump.mkdir()
+    _reload_dump(dump, "corso1", {"metadata": {"label": "prod"}})
+    (dump / "no-header.yml").write_text("metadata:\n  label: x\n", encoding="utf-8")
+    client = FakeClient(agents=[_agent("corso1")])
+
+    rc = cli.main(["--reload-dir", str(dump), "--yaml"], client_factory=lambda: client)
+
+    assert rc == 2
+    payload = yaml.safe_load(capsys.readouterr().out)
+    assert [entry["agent"] for entry in payload["agents"]] == ["corso1"]
+    assert payload["errors"][0]["file"] == "no-header.yml"
+    assert "agent-id" in payload["errors"][0]["error"]
+
+
+def test_reload_dir_dry_run_plans_creation_without_writes(tmp_path, capsys):
+    dump = tmp_path / "dump"
+    dump.mkdir()
+    _reload_dump(dump, "corso1", {"metadata": {"label": "prod"}})
+    _reload_dump(dump, "nuovo", {"metadata": {"label": "qa"}})
+    client = FakeClient(agents=[_agent("corso1")])
+
+    rc = cli.main(["--reload-dir", str(dump), "--yaml"], client_factory=lambda: client)
+
+    assert rc == 2
+    payload = yaml.safe_load(capsys.readouterr().out)
+    assert payload["agents"] == [
+        {"agent": "corso1", "ops": ["metadata"], "metadata_keys": ["label"]},
+        {"agent": "nuovo", "ops": ["create", "metadata"], "metadata_keys": ["label"]},
+    ]
+    assert client.calls_to("post_agent_create") == []
+    assert [name for name, _args in client.calls if name.startswith("put_")] == []
+
+
+def test_reload_dir_system_wide_requires_the_flag(tmp_path, capsys):
+    dump = tmp_path / "dump"
+    dump.mkdir()
+    system = _reload_dump(dump, "system", {"embedder": {"OpenAIEmbedder": {"model": "e"}}})
+    _reload_manifest(dump, [{"agent_id": "system", "role": "system", "file": system.name}])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--reload-dir", str(dump)], client_factory=_forbidden_factory)
+
+    assert excinfo.value.code == 2
+    assert "--allow-system-wide" in capsys.readouterr().err
+
+
+def test_reload_dir_system_dump_with_empty_metadata_has_no_metadata_op(tmp_path, capsys):
+    dump = tmp_path / "dump"
+    dump.mkdir()
+    system = _reload_dump(
+        dump,
+        "system",
+        {"metadata": {}, "embedder": {"OpenAIEmbedder": {"model": "e"}}},
+    )
+    _reload_manifest(dump, [{"agent_id": "system", "role": "system", "file": system.name}])
+    client = FakeClient(agents=[_agent("corso1")])
+
+    rc = cli.main(
+        ["--reload-dir", str(dump), "--allow-system-wide", "--yaml"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 2
+    payload = yaml.safe_load(capsys.readouterr().out)
+    assert payload["agents"] == [{"agent": "system", "ops": [], "metadata_keys": []}]
+    assert payload["system_wide"] == [{"op": "system:embedder:OpenAIEmbedder"}]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--agent", "corso"],
+        ["--all"],
+        ["--exclude", "x"],
+        ["--llm", "gpt-4={}"],
+        ["--plugin", "foo=on"],
+        ["--metadata", "k=v"],
+        ["--name", "X"],
+        ["--set", "llm:X:y=1"],
+        ["--patch", "x.yml"],
+        ["--restore", "x.yml"],
+        ["--create-missing"],
+        ["--dump", "/tmp/x"],
+        ["--diff"],
+        ["--dump-only", "llm"],
+        ["--dump-secrets"],
+        ["--dump-manifest-only"],
+    ],
+)
+def test_reload_dir_is_exclusive_with_every_other_mode(tmp_path, capsys, extra):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--reload-dir", str(tmp_path), *extra], client_factory=_forbidden_factory)
+
+    assert excinfo.value.code == 2
+    assert "--reload-dir" in capsys.readouterr().err
+
+
+def test_all_still_excludes_the_synthesized_system_agent(capsys):
+    client = FakeClient(agents=[_agent("corso1")])
+
+    rc = cli.main(["--all", "--metadata", "label=qa", "--yaml"], client_factory=lambda: client)
+
+    assert rc == 2
+    payload = yaml.safe_load(capsys.readouterr().out)
+    assert [entry["agent"] for entry in payload["agents"]] == ["corso1"]
+
+
+def test_create_missing_system_agent_exits_2(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(
+            ["--agent", "system", "--create-missing", "--metadata", "label=qa"],
+            client_factory=_forbidden_factory,
+        )
+
+    assert excinfo.value.code == 2
+    assert "the system agent cannot be created" in capsys.readouterr().err
+
+
+def test_empty_metadata_produces_no_operation(tmp_path):
+    patch = tmp_path / "patch.yml"
+    patch.write_text("metadata: {}\n", encoding="utf-8")
+    args = Namespace(
+        patch=str(patch),
+        set=[],
+        metadata=[],
+        name=None,
+        llm=[],
+        plugin=[],
+        allow_system_wide=False,
+    )
+
+    operations, system_wide = cli._build_operations(args)
+
+    assert operations == []
+    assert system_wide == []
+
+
+def test_system_update_applies_per_agent_ops_and_system_wide_once(tmp_path, capsys):
+    patch = tmp_path / "system.yml"
+    patch.write_text(
+        "metadata:\n  name: S\nembedder:\n  OpenAIEmbedder:\n    model: e\n",
+        encoding="utf-8",
+    )
+    client = FakeClient(
+        agents=[_agent("corso1")],
+        settings={("embedder", "OpenAIEmbedder"): {"model": "old"}},
+    )
+
+    rc = cli.main(
+        [
+            "--agent",
+            "system",
+            "--patch",
+            str(patch),
+            "--allow-system-wide",
+            "--yes",
+            "--yaml",
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert client.calls_to("put_agent") == [("system", {"name": "S"})]
+    assert client.calls_to("put_embedder_settings") == [("OpenAIEmbedder", {"model": "e"})]
+    payload = yaml.safe_load(capsys.readouterr().out)
+    assert payload["agents"][0]["agent_id"] == "system"
+    assert payload["system_wide"] == [
+        {"op": "system:embedder:OpenAIEmbedder", "status": "ok", "detail": "merged"}
+    ]
+
+
+def test_system_update_isolates_per_agent_failures_and_still_runs_system_wide(tmp_path, capsys):
+    patch = tmp_path / "system.yml"
+    patch.write_text(
+        "metadata:\n  name: S\nembedder:\n  OpenAIEmbedder:\n    model: e\n",
+        encoding="utf-8",
+    )
+    client = FakeClient(
+        agents=[_agent("corso1")],
+        settings={("embedder", "OpenAIEmbedder"): {"model": "old"}},
+        fail_on={"put_agent"},
+    )
+
+    rc = cli.main(
+        [
+            "--agent",
+            "system",
+            "--patch",
+            str(patch),
+            "--allow-system-wide",
+            "--yes",
+            "--yaml",
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 1
+    assert client.calls_to("put_embedder_settings") == [("OpenAIEmbedder", {"model": "e"})]
+    payload = yaml.safe_load(capsys.readouterr().out)
+    assert payload["agents"][0]["ok"] is False
+    assert payload["system_wide"][0]["status"] == "ok"

@@ -2044,3 +2044,46 @@ def test_dump_requires_a_selection(capsys):
 
     assert excinfo.value.code == 2
     assert "--agent" in capsys.readouterr().err
+
+
+# --- Todo 2: dump selection includes system and widgets --------------------
+
+
+def test_select_agents_include_internal_all_keeps_system_and_widgets():
+    agents = [_agent("system"), _agent("__widget1"), _agent("corso")]
+
+    selected = cli.select_agents(agents, [], True, [], include_internal=True)
+
+    assert [agent.agent_id for agent in selected] == ["system", "__widget1", "corso"]
+
+
+def test_select_agents_without_include_internal_still_skips_internal():
+    agents = [_agent("system"), _agent("__widget1"), _agent("corso")]
+
+    selected = cli.select_agents(agents, [], True, [])
+
+    assert [agent.agent_id for agent in selected] == ["corso"]
+
+
+def test_select_agents_include_internal_substring_matches_a_widget():
+    agents = [_agent("system"), _agent("__widget1"), _agent("corso")]
+
+    selected = cli.select_agents(agents, ["widget"], False, [], include_internal=True)
+
+    assert [agent.agent_id for agent in selected] == ["__widget1"]
+
+
+def test_select_agents_include_internal_still_applies_exclude():
+    agents = [_agent("system"), _agent("__widget1"), _agent("corso")]
+
+    selected = cli.select_agents(agents, [], True, ["__"], include_internal=True)
+
+    assert [agent.agent_id for agent in selected] == ["system", "corso"]
+
+
+@pytest.mark.parametrize(
+    ("agent_id", "role"),
+    [("system", "system"), ("__widget1", "widget"), ("corso", "agent")],
+)
+def test_agent_role(agent_id, role):
+    assert cli._agent_role(agent_id) == role

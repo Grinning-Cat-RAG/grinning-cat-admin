@@ -44,15 +44,22 @@ def select_agents(
     substrings: list[str],
     include_all: bool,
     exclude: list[str],
+    include_internal: bool = False,
 ) -> list[AgentOutput]:
     """Pick the agents to update, preserving the order of ``agents``.
 
-    ``--all`` skips the ``system`` agent and every ``__*`` internal agent.
+    ``--all`` skips the ``system`` agent and every ``__*`` internal agent,
+    unless ``include_internal`` is set (the dump mode wants them).
     A substring that matches nothing is fatal: silently updating a smaller
     set than the operator asked for is the worst failure mode here.
     """
     if include_all:
-        candidates = [a for a in agents if a.agent_id != "system" and not a.agent_id.startswith("__")]
+        if include_internal:
+            candidates = list(agents)
+        else:
+            candidates = [
+                a for a in agents if a.agent_id != "system" and not a.agent_id.startswith("__")
+            ]
     else:
         candidates = []
         for substring in substrings:
@@ -75,6 +82,15 @@ def select_agents(
     if not selected:
         raise SelectionError("no agents selected")
     return selected
+
+
+def _agent_role(agent_id: str) -> str:
+    """Classify an agent id: ``system``, a ``__*`` widget, or a normal agent."""
+    if agent_id == "system":
+        return "system"
+    if agent_id.startswith("__"):
+        return "widget"
+    return "agent"
 
 
 def render_plan(
@@ -1143,7 +1159,13 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
         operations = per_agent
     else:
         try:
-            selected = select_agents(agents, args.agent or [], args.all, args.exclude or [])
+            selected = select_agents(
+                agents,
+                args.agent or [],
+                args.all,
+                args.exclude or [],
+                include_internal=bool(args.dump),
+            )
         except SelectionError as exc:
             print(str(exc), file=sys.stderr)
             return 2

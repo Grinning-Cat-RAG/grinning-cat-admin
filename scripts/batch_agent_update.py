@@ -639,6 +639,19 @@ def _plugin_active(client: Any, agent_id: str, name: str) -> bool:
     return bool(item.local_info.get("active", False)) if item is not None else False
 
 
+def _safe_plugin_active(client: Any, agent_id: str, name: str) -> bool:
+    """Read a plugin's active flag, tolerating agents without a plugin manager.
+
+    The core answers ``GET /plugins/`` with an error for an agent that has no
+    plugin manager (e.g. ``system``); the snapshot must not abort for a flag
+    that is only informational.
+    """
+    try:
+        return _plugin_active(client, agent_id, name)
+    except Exception:  # noqa: BLE001 - an unreadable flag must not abort the snapshot
+        return False
+
+
 def _read_operation_state(client: Any, agent: AgentOutput, operation: Operation) -> Any:
     """Read the current value of one operation, before any write of the run."""
     if operation.kind == "metadata":
@@ -822,12 +835,17 @@ def _build_snapshot(
         if operation.kind == "llm":
             snapshot["llm"][operation.name] = dict(state)
         elif operation.kind == "plugin":
+            if not state:
+                # An inactive plugin has no applied settings and the core cannot
+                # serve them (GET /plugins/settings/<id> -> 500 KeyError).
+                snapshot["plugins"][operation.name] = {"active": False, "settings": {}}
+                continue
             settings = client.plugins.get_plugin_settings(operation.name, agent.agent_id).value
-            snapshot["plugins"][operation.name] = {"active": bool(state), "settings": dict(settings)}
+            snapshot["plugins"][operation.name] = {"active": True, "settings": dict(settings)}
         elif operation.kind == "settings":
             if operation.category == "plugins":
                 snapshot["plugins"][operation.name] = {
-                    "active": _plugin_active(client, agent.agent_id, operation.name),
+                    "active": _safe_plugin_active(client, agent.agent_id, operation.name),
                     "settings": dict(state),
                 }
             else:

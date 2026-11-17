@@ -1551,6 +1551,128 @@ def test_snapshot_contains_metadata_llm_plugins_and_categories(tmp_path):
     assert snapshot["categories"] == {"chunking": {"default": {"chunk_size": 256}}}
 
 
+def test_snapshot_skips_settings_of_an_inactive_plugin(tmp_path):
+    client = FakeClient(
+        agents=[_agent("corso1")],
+        plugins={"corso1": {"foo": False}},
+        plugin_settings_500_inactive=True,
+    )
+
+    rc = cli.main(
+        ["--agent", "corso", "--plugin", "foo=off", "--yes", "--backup-out", str(tmp_path)],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert client.calls_to("get_plugin_settings") == []
+    snapshot = yaml.safe_load(_snapshot_files(tmp_path)[0].read_text(encoding="utf-8"))
+    assert snapshot["plugins"] == {"foo": {"active": False, "settings": {}}}
+
+
+def test_snapshot_still_reads_settings_of_an_active_plugin(tmp_path):
+    client = FakeClient(
+        agents=[_agent("corso1")],
+        plugins={"corso1": {"foo": True}},
+        plugin_settings={("corso1", "foo"): {"k": "v"}},
+        plugin_settings_500_inactive=True,
+    )
+
+    rc = cli.main(
+        ["--agent", "corso", "--plugin", "foo=off", "--yes", "--backup-out", str(tmp_path)],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert client.calls_to("get_plugin_settings") == [("foo", "corso1")]
+    snapshot = yaml.safe_load(_snapshot_files(tmp_path)[0].read_text(encoding="utf-8"))
+    assert snapshot["plugins"] == {"foo": {"active": True, "settings": {"k": "v"}}}
+
+
+def test_plugin_op_without_a_plugin_manager_is_isolated_and_does_not_abort_the_snapshot(
+    tmp_path, capsys
+):
+    client = FakeClient(agents=[_agent("corso1")], fail_on={"get_available_plugins"})
+
+    rc = cli.main(
+        [
+            "--agent",
+            "corso",
+            "--plugin",
+            "foo=on",
+            "--metadata",
+            "label=qa",
+            "--yes",
+            "--backup-out",
+            str(tmp_path),
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 1
+    assert client.calls_to("put_agent") == [("corso1", {"label": "qa"})]
+    snapshot = yaml.safe_load(_snapshot_files(tmp_path)[0].read_text(encoding="utf-8"))
+    assert snapshot["plugins"] == {}
+    assert "op=plugin:foo result=failed" in capsys.readouterr().out
+
+
+def test_plugin_settings_snapshot_tolerates_a_missing_plugin_manager(tmp_path):
+    patch = tmp_path / "settings.yml"
+    patch.write_text("plugins:\n  foo:\n    opt: 1\n", encoding="utf-8")
+    client = FakeClient(agents=[_agent("corso1")], fail_on={"get_available_plugins"})
+
+    rc = cli.main(
+        [
+            "--agent",
+            "corso",
+            "--patch",
+            str(patch),
+            "--yes",
+            "--backup-out",
+            str(tmp_path / "backup"),
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    snapshot = yaml.safe_load(_snapshot_files(tmp_path / "backup")[0].read_text(encoding="utf-8"))
+    assert snapshot["plugins"] == {"foo": {"active": False, "settings": {}}}
+
+
+def test_patch_reload_with_active_and_inactive_plugins_succeeds(tmp_path):
+    patch = tmp_path / "dump.yml"
+    patch.write_text(
+        "active_plugins:\n  foo: on\n  bar: off\nplugins:\n  foo:\n    opt: 1\n",
+        encoding="utf-8",
+    )
+    client = FakeClient(
+        agents=[_agent("corso1")],
+        plugins={"corso1": {"foo": True, "bar": False}},
+        plugin_settings={("corso1", "foo"): {"opt": 1}},
+        plugin_settings_500_inactive=True,
+    )
+
+    rc = cli.main(
+        [
+            "--agent",
+            "corso",
+            "--patch",
+            str(patch),
+            "--yes",
+            "--backup-out",
+            str(tmp_path / "backup"),
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert ("bar", "corso1") not in client.calls_to("get_plugin_settings")
+    snapshot = yaml.safe_load(_snapshot_files(tmp_path / "backup")[0].read_text(encoding="utf-8"))
+    assert snapshot["plugins"] == {
+        "foo": {"active": True, "settings": {"opt": 1}},
+        "bar": {"active": False, "settings": {}},
+    }
+
+
 def test_yaml_report_for_a_failed_agent_carries_the_detail(capsys):
     client = FakeClient(agents=[_agent("corso1")], updated_false={"corso1"})
 

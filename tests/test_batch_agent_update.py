@@ -1977,3 +1977,70 @@ def test_cli_plugin_beats_active_plugins_when_applied(tmp_path):
     assert rc == 0
     assert client.calls_to("put_toggle_plugin") == [("foo", "corso1")]
     assert client.plugin_states["corso1"]["foo"] is True
+
+
+# --- Todo 1: dump flags and validation -------------------------------------
+
+
+def test_help_lists_the_dump_flags(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--help"], client_factory=_forbidden_factory)
+
+    assert excinfo.value.code == 0
+    out = capsys.readouterr().out
+    for flag in ("--dump", "--dump-only", "--dump-secrets", "--diff", "--dump-manifest-only"):
+        assert flag in out
+
+
+def test_dump_is_exclusive_with_yes(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--dump", "/tmp/x", "--all", "--yes"], client_factory=_forbidden_factory)
+
+    assert excinfo.value.code == 2
+    assert "--yes" in capsys.readouterr().err
+
+
+def test_dump_is_exclusive_with_operations(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--dump", "/tmp/x", "--all", "--llm", "gpt-4={}"], client_factory=_forbidden_factory)
+
+    assert excinfo.value.code == 2
+    assert "--llm" in capsys.readouterr().err
+
+
+def test_dump_is_exclusive_with_restore(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--dump", "/tmp/x", "--all", "--restore", "snap.json"], client_factory=_forbidden_factory)
+
+    assert excinfo.value.code == 2
+    assert "--restore" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [["--dump-only", "llm"], ["--dump-secrets"], ["--diff"], ["--dump-manifest-only"]],
+)
+def test_dump_modifiers_require_dump(flag, capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--all", *flag], client_factory=_forbidden_factory)
+
+    assert excinfo.value.code == 2
+    assert "--dump" in capsys.readouterr().err
+
+
+def test_diff_requires_an_existing_directory(tmp_path, capsys):
+    missing = tmp_path / "missing"
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--dump", str(missing), "--all", "--diff"], client_factory=_forbidden_factory)
+
+    assert excinfo.value.code == 2
+    assert "--diff" in capsys.readouterr().err
+
+
+def test_dump_requires_a_selection(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--dump", "/tmp/x"], client_factory=_forbidden_factory)
+
+    assert excinfo.value.code == 2
+    assert "--agent" in capsys.readouterr().err

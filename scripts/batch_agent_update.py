@@ -1017,11 +1017,59 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="INT",
         help="parallel workers, one task per agent (default: 1)",
     )
+    parser.add_argument(
+        "--dump",
+        metavar="DIR",
+        help="write the selected agents' configuration as YAML files into DIR",
+    )
+    parser.add_argument(
+        "--dump-only",
+        action="append",
+        metavar="CATEGORY",
+        help="dump only this category (repeatable; requires --dump)",
+    )
+    parser.add_argument(
+        "--dump-secrets",
+        action="store_true",
+        help="include secret-looking fields in the dump (default: omitted)",
+    )
+    parser.add_argument(
+        "--diff",
+        action="store_true",
+        help="compare the live configuration with the existing dump in DIR (requires --dump)",
+    )
+    parser.add_argument(
+        "--dump-manifest-only",
+        action="store_true",
+        help="write only manifest.yml, without per-agent files (requires --dump)",
+    )
     return parser
 
 
 def _validate(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """Reject impossible command lines before any client is built."""
+    if args.dump:
+        conflicting = [flag for flag in OPERATION_FLAGS if getattr(args, flag)]
+        if args.restore:
+            conflicting.append("restore")
+        if args.yes:
+            conflicting.append("yes")
+        if conflicting:
+            parser.error(f"--dump cannot be combined with --{conflicting[0]}")
+        if not args.agent and not args.all:
+            parser.error("--dump requires --agent or --all")
+        if args.diff and not Path(args.dump).is_dir():
+            parser.error(f"--diff requires an existing directory: {args.dump!r}")
+        return
+
+    dump_modifiers = [
+        name
+        for name in ("dump_only", "dump_secrets", "diff", "dump_manifest_only")
+        if getattr(args, name)
+    ]
+    if dump_modifiers:
+        parser.error(f"--{dump_modifiers[0].replace('_', '-')} requires --dump")
+
     if args.restore:
         conflicting = [flag for flag in OPERATION_FLAGS if getattr(args, flag)]
         if conflicting:

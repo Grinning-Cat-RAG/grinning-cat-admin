@@ -798,10 +798,56 @@ def _exit_code(envelope: dict[str, Any]) -> int:
     return 0
 
 
+_EXAMPLES = """\
+examples:
+  # 1. Select an LLM configuration and set its model. The OpenRouter configuration used from
+  #    ADMIN pulls its model parameters from openrouter.ai, so model must be a valid
+  #    OpenRouter model id; run the dry-run first and read the plan before adding --yes.
+  uv run python scripts/batch_agent_update.py --agent corso --set llm:openrouter:model=anthropic/claude-3.5-sonnet
+  uv run python scripts/batch_agent_update.py --agent corso --llm openrouter='{"model": "anthropic/claude-3.5-sonnet"}'
+
+  # 2. Set api_key of an LLM configuration; any other key (temperature, base_url, ...) works the same way.
+  uv run python scripts/batch_agent_update.py --agent corso --set llm:openrouter:api_key=sk-...
+  #    For a secret that must not land in shell history, keep it in a patch file instead:
+  uv run python scripts/batch_agent_update.py --agent corso --patch examples/patch.json
+
+  # 3. Add or overwrite an agent metadata key; --name is the shortcut for --metadata name=VALUE.
+  #    Metadata keys are literal: dotted nesting is only available through --set.
+  uv run python scripts/batch_agent_update.py --agent corso --metadata label=production
+  uv run python scripts/batch_agent_update.py --agent corso --name "New name"
+
+  # 4. Enable or disable a plugin. The current state is read first, so a repeated run is
+  #    idempotent and never toggles twice.
+  uv run python scripts/batch_agent_update.py --agent corso --plugin my_plugin=on
+  uv run python scripts/batch_agent_update.py --agent corso --plugin my_plugin=off
+
+  # 5. Modify a plugin setting. Values are deep-merged and dotted keys create nested branches.
+  uv run python scripts/batch_agent_update.py --agent corso --set plugins:my_plugin:options.enabled=true
+
+  # 6. Everything else.
+  #    A patch file carries the full shape: {"llm": {...}, "plugins": {...}, "metadata": {...}}.
+  uv run python scripts/batch_agent_update.py --agent corso --patch examples/patch.json
+  #    Several agents at once, minus the test ones.
+  uv run python scripts/batch_agent_update.py --agent corso --agent lab --exclude test --metadata label=production
+  #    Every non-system agent, writing with a before-snapshot.
+  uv run python scripts/batch_agent_update.py --all --exclude system --yes --backup-out ./backup --plugin my_plugin=on
+  #    Restore a snapshot file or directory written by --backup-out.
+  uv run python scripts/batch_agent_update.py --restore ./backup --yes
+  #    System-wide categories (embedder, ingestion) re-embed every agent: opt in explicitly.
+  uv run python scripts/batch_agent_update.py --all --set embedder:openai:key=sk-... --allow-system-wide
+  #    Parallel workers, one task per agent.
+  uv run python scripts/batch_agent_update.py --all --plugin my_plugin=on --max-workers 4
+
+  # Safety: dry-run is the default; --yes writes; exit codes 0 = ok, 1 = failure, 2 = dry-run/abort.
+"""
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="batch_agent_update.py",
         description="Batch-update Grinning Cat agents through the official REST API (dry-run by default).",
+        epilog=_EXAMPLES,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--agent",

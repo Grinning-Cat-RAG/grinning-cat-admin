@@ -62,6 +62,33 @@ def test_help_lists_every_flag(capsys):
         assert flag in out
 
 
+def test_help_includes_examples(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--help"], client_factory=_forbidden_factory)
+
+    assert excinfo.value.code == 0
+    out = capsys.readouterr().out
+    assert "examples:" in out
+    for fragment in (
+        "--set llm:",
+        "api_key",
+        "--metadata",
+        "--plugin",
+        "--set plugins:",
+        "--patch",
+        "--restore",
+        "--allow-system-wide",
+        "--max-workers",
+    ):
+        assert fragment in out
+    invocations = [
+        line.strip()
+        for line in out.splitlines()
+        if line.strip().startswith("uv run python scripts/batch_agent_update.py")
+    ]
+    assert len(invocations) >= 10
+
+
 def test_usage_error_does_not_build_the_client(capsys):
     with pytest.raises(SystemExit) as excinfo:
         cli.main(["--agent", "x"], client_factory=_forbidden_factory)

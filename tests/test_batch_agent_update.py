@@ -2660,3 +2660,109 @@ def test_dump_configs_with_secrets_has_no_warning(tmp_path):
     header = (tmp_path / cli._dump_filename("corso")).read_text(encoding="utf-8")
     assert "# secret-policy: included" in header
     assert "# warnings: none" in header
+
+
+# --- Todo 8: --diff against an existing dump -------------------------------
+
+
+def _dump_once(tmp_path, client, *extra):
+    return cli.main(["--dump", str(tmp_path), "--all", *extra], client_factory=lambda: client)
+
+
+def test_diff_identical_exits_0_and_writes_nothing(tmp_path, capsys):
+    agents = [_agent("corso")]
+    client = FakeClient(agents=agents, factory_lists=_full_factory_lists("corso"))
+    assert _dump_once(tmp_path, client) == 0
+    before = {path.name: path.read_bytes() for path in tmp_path.glob("*.yml")}
+    capsys.readouterr()
+
+    rc = cli.main(
+        ["--dump", str(tmp_path), "--all", "--diff"], client_factory=lambda: client
+    )
+
+    assert rc == 0
+    after = {path.name: path.read_bytes() for path in tmp_path.glob("*.yml")}
+    assert before == after
+    assert [name for name, _args in client.calls if name.startswith("put_")] == []
+
+
+def test_diff_changed_exits_1(tmp_path, capsys):
+    agents = [_agent("corso")]
+    client = FakeClient(agents=agents, factory_lists=_full_factory_lists("corso"))
+    assert _dump_once(tmp_path, client) == 0
+    path = tmp_path / cli._dump_filename("corso")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("model: m", "model: changed"),
+        encoding="utf-8",
+    )
+    capsys.readouterr()
+
+    rc = cli.main(
+        ["--dump", str(tmp_path), "--all", "--diff"], client_factory=lambda: client
+    )
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "changed" in out
+
+
+def test_diff_empty_directory_exits_2(tmp_path, capsys):
+    agents = [_agent("corso")]
+    client = FakeClient(agents=agents, factory_lists=_full_factory_lists("corso"))
+
+    rc = cli.main(
+        ["--dump", str(tmp_path), "--all", "--diff"], client_factory=lambda: client
+    )
+
+    assert rc == 2
+    assert "no dump files" in capsys.readouterr().err
+
+
+def test_diff_corrupt_file_exits_2(tmp_path, capsys):
+    agents = [_agent("corso")]
+    client = FakeClient(agents=agents, factory_lists=_full_factory_lists("corso"))
+    (tmp_path / "bad.yml").write_text("not: [valid", encoding="utf-8")
+
+    rc = cli.main(
+        ["--dump", str(tmp_path), "--all", "--diff"], client_factory=lambda: client
+    )
+
+    assert rc == 2
+    assert "bad.yml" in capsys.readouterr().err
+
+
+def test_diff_json_envelope(tmp_path, capsys):
+    agents = [_agent("corso")]
+    client = FakeClient(agents=agents, factory_lists=_full_factory_lists("corso"))
+    assert _dump_once(tmp_path, client) == 0
+    capsys.readouterr()
+
+    rc = cli.main(
+        ["--dump", str(tmp_path), "--all", "--diff", "--json"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["identical"] is True
+    assert data["agents"][0]["agent_id"] == "corso"
+    assert data["agents"][0]["identical"] is True
+
+
+def test_diff_reports_a_selected_agent_without_a_file(tmp_path, capsys):
+    agents = [_agent("corso"), _agent("lab")]
+    lists = {**_full_factory_lists("corso"), **_full_factory_lists("lab")}
+    client = FakeClient(agents=agents, factory_lists=lists)
+    assert cli.main(
+        ["--dump", str(tmp_path), "--agent", "lab"], client_factory=lambda: client
+    ) == 0
+    capsys.readouterr()
+
+    rc = cli.main(
+        ["--dump", str(tmp_path), "--agent", "corso", "--diff"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "corso" in out

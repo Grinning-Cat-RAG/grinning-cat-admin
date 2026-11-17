@@ -10,6 +10,7 @@ operation failed, 2 = dry-run, abort or usage error.
 
 import argparse
 import contextlib
+import difflib
 import hashlib
 import json
 import os
@@ -981,6 +982,113 @@ def dump_configs(
     }
 
 
+def _read_dump_file(path: Path) -> tuple[str | None, str]:
+    """Return the ``agent-id`` header value and the comment-free YAML body."""
+    text = path.read_text(encoding="utf-8")
+    agent_id = None
+    for line in text.splitlines():
+        if line.startswith("# agent-id: "):
+            agent_id = line[len("# agent-id: ") :].strip()
+            break
+    body = "\n".join(line for line in text.splitlines() if not line.startswith("#"))
+    return agent_id, body
+
+
+def _normalize_payload(payload: Any) -> str:
+    """Canonical YAML for a payload, so key order never shows up as a diff."""
+    return yaml.safe_dump(
+        payload,
+        sort_keys=True,
+        default_flow_style=False,
+        allow_unicode=True,
+    )
+
+
+def diff_configs(
+    client: Any,
+    selected: list[AgentOutput],
+    directory: Path,
+    categories: list[str],
+    include_secrets: bool,
+) -> dict[str, Any]:
+    """Compare the live configuration with the dump files in ``directory``.
+
+    Read-only: it never writes a file and never calls a ``put_*`` endpoint.
+    """
+    directory = Path(directory)
+    if not directory.is_dir():
+        raise ValueError(f"--diff requires an existing directory: {str(directory)!r}")
+    files = sorted(
+        path
+        for path in directory.glob("*.yml")
+        if path.name != "manifest.yml" and not path.name.startswith(".")
+    )
+    if not files:
+        raise ValueError(f"no dump files found in {str(directory)!r}")
+
+    dumped: dict[str, str] = {}
+    for path in files:
+        try:
+            agent_id, body = _read_dump_file(path)
+        except OSError as exc:
+            raise ValueError(f"cannot read dump file {str(path)!r}: {exc}") from None
+        try:
+            load_patch(str(path))
+        except ValueError as exc:
+            raise ValueError(str(exc)) from None
+        dumped[agent_id or path.stem] = body
+
+    results: list[dict[str, Any]] = []
+    selected_ids: set[str] = set()
+    for agent in selected:
+        agent_id = agent.agent_id
+        selected_ids.add(agent_id)
+        effective = _effective_categories(categories, _agent_role(agent_id))
+        live_text = _normalize_payload(
+            _dump_agent_config(client, agent, effective, include_secrets)
+        )
+        if agent_id not in dumped:
+            results.append(
+                {
+                    "agent_id": agent_id,
+                    "identical": False,
+                    "diff": f"missing dump file for {agent_id}\n",
+                }
+            )
+            continue
+        try:
+            file_payload = yaml.safe_load(dumped[agent_id]) or {}
+        except yaml.YAMLError as exc:
+            raise ValueError(f"invalid dump file for {agent_id!r}: {exc}") from None
+        file_text = _normalize_payload(file_payload)
+        identical = file_text == live_text
+        diff = (
+            ""
+            if identical
+            else "".join(
+                difflib.unified_diff(
+                    file_text.splitlines(keepends=True),
+                    live_text.splitlines(keepends=True),
+                    fromfile=f"{agent_id} (dump)",
+                    tofile=f"{agent_id} (live)",
+                )
+            )
+        )
+        results.append({"agent_id": agent_id, "identical": identical, "diff": diff})
+
+    for agent_id in dumped:
+        if agent_id not in selected_ids:
+            results.append(
+                {
+                    "agent_id": agent_id,
+                    "identical": False,
+                    "diff": f"dump file for {agent_id} has no selected agent\n",
+                }
+            )
+
+    return {"identical": all(entry["identical"] for entry in results), "agents": results}
+
+
 def _run_agent(
     client: Any,
     agent: AgentOutput,
@@ -1218,6 +1326,17 @@ def _report_dump(envelope: dict[str, Any], as_json: bool) -> None:
 
 def _dump_exit_code(envelope: dict[str, Any]) -> int:
     return 0 if all(entry["ok"] for entry in envelope["agents"]) else 1
+
+
+def _report_diff(envelope: dict[str, Any], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(envelope, indent=2))
+        return
+    for entry in envelope["agents"]:
+        result = "identical" if entry["identical"] else "different"
+        print(f"[diff] agent={entry['agent_id']} result={result}")
+        if entry["diff"]:
+            print(entry["diff"], end="" if entry["diff"].endswith("\n") else "\n")
 
 
 _EXAMPLES = """\
@@ -1477,6 +1596,16 @@ def _run_dump(
             parser.error(
                 f"--dump-only {system_wide[0]} is system-wide and requires only the system agent"
             )
+    if args.diff:
+        try:
+            diff_envelope = diff_configs(
+                client, selected, Path(args.dump), categories, args.dump_secrets
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        _report_diff(diff_envelope, args.json)
+        return 0 if diff_envelope["identical"] else 1
     envelope = dump_configs(
         client,
         selected,

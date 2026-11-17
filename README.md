@@ -126,7 +126,7 @@ GRINNING_CAT_API_SECURE_CONNECTION=false
 | `--metadata KEY=VALUE` | merge one metadata key (repeatable) |
 | `--name VALUE` | shortcut for `--metadata name=VALUE` |
 | `--set CATEGORY:NAME:KEY=VALUE` | patch one factory setting (repeatable) |
-| `--patch FILE` | JSON file with per-category patches |
+| `--patch FILE` | JSONC file with per-category patches and `active_plugins` |
 | `--yes` | apply the changes (default: dry-run) |
 | `--json` | print the plan as JSON |
 | `--backup-out DIR` | directory for the before-snapshot |
@@ -138,15 +138,19 @@ GRINNING_CAT_API_SECURE_CONNECTION=false
 
 `--set CATEGORY:NAME:KEY=VALUE` patches one factory setting. `CATEGORY` is one of `llm`, `chunking`, `vector_database`, `auth_handler`, `agentic_workflow`, `context_retriever`, `file_manager`, `plugins`, `metadata`, `embedder` or `ingestion`. `NAME` is the setting name (the model for `llm`, the plugin id for `plugins`). `KEY` may be dotted (`a.b.c`) to reach nested values. Values are decoded as JSON when possible, otherwise kept as strings.
 
-`--patch FILE` takes a JSON object keyed by category, then by name:
+`--patch FILE` takes a JSON **or JSONC** object keyed by category, then by name. JSONC adds `//` line comments, `/* */` block comments and trailing commas before `}` or `]`; a `"//"` or `"/*"` inside a string is data, not a comment:
 
-```json
+```jsonc
 {
+  // one category per top-level key, then one entry per setting name
   "llm": {"gpt-4": {"temperature": 0.2}},
   "plugins": {"foo": {"k": "v"}},
-  "metadata": {"name": "X"}
+  "metadata": {"name": "X"},
+  "active_plugins": {"foo": true, /* reconciled like --plugin */ "bar": false},
 }
 ```
+
+`active_plugins` is the one top-level key that is **not** a category: it maps a plugin name to a boolean and produces the same operation as `--plugin`, so it reconciles the current state and never toggles twice. Values must be the booleans `true` or `false`; anything else is a usage error. When the same plugin is named both in the file and on the command line, the explicit `--plugin NAME=on|off` **wins** over the file value.
 
 ### How the patches are applied
 
@@ -189,6 +193,21 @@ uv run python scripts/batch_agent_update.py \
   --metadata label=b \
   --yes \
   --backup-out ./backup
+```
+
+#### Patch file examples
+
+Two ready-to-use JSONC files ship in `examples/`; copy one, adapt the names and values, and run it. Both accept `//` and `/* */` comments and trailing commas.
+
+| File | What it shows |
+| --- | --- |
+| [`examples/patch-llm-openrouter.jsonc`](examples/patch-llm-openrouter.jsonc) | a single LLM change on the OpenRouter configuration used from ADMIN (`model` must be a valid OpenRouter id) |
+| [`examples/patch-full-agent.jsonc`](examples/patch-full-agent.jsonc) | the "everything" shape: metadata, LLM, chunker, plugin settings and the active plugin set |
+
+```bash
+uv run python scripts/batch_agent_update.py \
+  --agent corso \
+  --patch examples/patch-full-agent.jsonc
 ```
 
 ## Contributing

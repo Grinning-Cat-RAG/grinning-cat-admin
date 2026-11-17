@@ -1460,6 +1460,14 @@ examples:
   #    Parallel workers, one task per agent.
   uv run python scripts/batch_agent_update.py --all --plugin my_plugin=on --max-workers 4
 
+  # 7. Dump the live configuration to YAML, then reload it with --patch.
+  #    Every agent, including system and the __* widgets.
+  uv run python scripts/batch_agent_update.py --dump ./dump --all
+  #    Only one category.
+  uv run python scripts/batch_agent_update.py --dump ./dump --agent corso --dump-only llm
+  #    Verify a dump against the live configuration; exit 0 means identical.
+  uv run python scripts/batch_agent_update.py --dump ./dump --all --diff
+
   # Safety: dry-run is the default; --yes writes; exit codes 0 = ok, 1 = failure, 2 = dry-run/abort.
 """
 

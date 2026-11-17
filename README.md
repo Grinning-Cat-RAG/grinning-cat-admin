@@ -227,6 +227,38 @@ uv run python scripts/batch_agent_update.py \
   --patch examples/patch-full-agent.yml
 ```
 
+### Dump and reload a configuration
+
+`--dump DIR` exports the selected agents' current configuration as YAML in the same grammar as a patch file, so a dump can be edited and reloaded with `--patch`. The dump is read-only: it never writes to the core.
+
+```bash
+uv run python scripts/batch_agent_update.py --dump ./dump --all
+```
+
+Each selected agent gets one file named `DIR/<agent_id>-<sha1_8>.yml`, where `<sha1_8>` is the first eight hex characters of the SHA-1 of the agent id, so the name stays filesystem-safe and collision-free. A `DIR/manifest.yml` lists every agent with its role, file, categories, selected configurations, plugins, warnings and the number of omitted secrets.
+
+Every dump file starts with a YAML comment header: `dump-format`, `generated-at`, `agent-id`, `agent-role`, `categories`, `selected`, `argv`, `source-host`, `secret-policy` and `warnings`. The header documents how and when the file was produced; the body below it is a normal patch document.
+
+The `agent-role` is `system` for the system agent (which also carries the system-wide `embedder` and `ingestion` settings), `widget` for ids starting with `__`, and `agent` for everything else. `--all` includes `system` and the `__*` widgets in a dump.
+
+Secret-looking fields (`api_key`, `*_secret`, `password`, `*_token`) are omitted by default; pass `--dump-secrets` to include them. Omitted fields are preserved on reload because the patch merges into the existing configuration, so a dump without secrets is still safe to reload.
+
+To reload, apply the file with `--patch`, dry-run first:
+
+```bash
+uv run python scripts/batch_agent_update.py --agent corso --patch ./dump/corso-1a2b3c4d.yml
+```
+
+Reloading a `system` dump that contains `embedder` or `ingestion` requires `--allow-system-wide`, because those settings re-embed every agent.
+
+`--diff` compares an existing dump with the live configuration and never writes: it exits 0 when the dump matches and 1 when it differs.
+
+```bash
+uv run python scripts/batch_agent_update.py --dump ./dump --all --diff
+```
+
+`--dump-only CATEGORY` restricts the dump to one category (repeatable). `--dump-manifest-only` writes only `manifest.yml`, without the per-agent files.
+
 ## Contributing
 
 We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.

@@ -2766,3 +2766,42 @@ def test_diff_reports_a_selected_agent_without_a_file(tmp_path, capsys):
     assert rc == 1
     out = capsys.readouterr().out
     assert "corso" in out
+
+
+# --- Todo 9: --dump-manifest-only ------------------------------------------
+
+
+def test_dump_manifest_only_writes_only_the_manifest(tmp_path):
+    agents = [_agent("corso")]
+    client = FakeClient(
+        agents=agents,
+        factory_lists=_full_factory_lists("corso"),
+        plugins={"corso": {"foo": True, "bar": False}},
+        plugin_settings={("corso", "foo"): {"opt": 1}},
+    )
+
+    rc = cli.main(
+        ["--dump", str(tmp_path), "--all", "--dump-manifest-only"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert [path.name for path in tmp_path.glob("*.yml")] == ["manifest.yml"]
+    manifest = yaml.safe_load((tmp_path / "manifest.yml").read_text(encoding="utf-8"))
+    entry = manifest["agents"][0]
+    assert entry["file"] is None
+    assert entry["plugins"] == 2
+    assert entry["selected"]["llm"] == "LLMOpenRouterConfig"
+    assert entry["categories"]
+    assert client.calls_to("get_plugin_settings") == []
+
+
+def test_dump_manifest_only_is_exclusive_with_diff(tmp_path, capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(
+            ["--dump", str(tmp_path), "--all", "--dump-manifest-only", "--diff"],
+            client_factory=_forbidden_factory,
+        )
+
+    assert excinfo.value.code == 2
+    assert "--diff" in capsys.readouterr().err

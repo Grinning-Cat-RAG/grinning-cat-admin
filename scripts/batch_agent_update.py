@@ -1089,6 +1089,72 @@ def diff_configs(
     return {"identical": all(entry["identical"] for entry in results), "agents": results}
 
 
+def dump_manifest_only(
+    client: Any,
+    selected: list[AgentOutput],
+    directory: Path,
+    categories: list[str],
+    include_secrets: bool,
+    argv: list[str],
+) -> dict[str, Any]:
+    """Write only ``manifest.yml``: no per-agent files, no plugin settings reads."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    host = socket.gethostname()
+    secret_policy = "included" if include_secrets else "omitted"
+    argv = list(argv)
+
+    entries: list[dict[str, Any]] = []
+    for agent in selected:
+        role = _agent_role(agent.agent_id)
+        effective = _effective_categories(categories, role)
+        entry: dict[str, Any] = {
+            "agent_id": agent.agent_id,
+            "role": role,
+            "file": None,
+            "categories": effective,
+            "selected": {},
+            "plugins": 0,
+            "warnings": [],
+            "omitted_secrets": 0,
+            "ok": True,
+            "reason": None,
+        }
+        try:
+            factory_categories = [
+                category
+                for category in effective
+                if category in FACTORY_LIST_GETTERS or category in SYSTEM_WIDE_CATEGORIES
+            ]
+            stats = {"omitted": 0}
+            payload = _dump_agent_config(
+                client, agent, factory_categories, include_secrets, stats=stats
+            )
+            entry["selected"] = {
+                category: next(iter(value))
+                for category, value in payload.items()
+                if category in FACTORY_LIST_GETTERS or category in SYSTEM_WIDE_CATEGORIES
+            }
+            collection = client.plugins.get_available_plugins(agent.agent_id)
+            entry["plugins"] = len(collection.installed)
+            entry["omitted_secrets"] = stats["omitted"]
+            if stats["omitted"]:
+                entry["warnings"].append(
+                    f"secrets omitted ({stats['omitted']} fields); reload preserves them"
+                )
+        except Exception as exc:  # noqa: BLE001 - one agent must not abort the manifest
+            entry["ok"] = False
+            entry["reason"] = str(exc)
+        entries.append(entry)
+
+    _write_dump_manifest(directory, entries, argv, host, secret_policy)
+    ok = sum(1 for entry in entries if entry["ok"])
+    return {
+        "agents": entries,
+        "summary": {"selected": len(selected), "ok": ok, "failed": len(entries) - ok},
+    }
+
+
 def _run_agent(
     client: Any,
     agent: AgentOutput,
@@ -1536,6 +1602,8 @@ def _validate(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None
                     f"unknown --dump-only category {unknown[0]!r}; "
                     f"valid categories: {', '.join(DUMP_CATEGORIES)}"
                 )
+        if args.diff and args.dump_manifest_only:
+            parser.error("--dump-manifest-only cannot be combined with --diff")
         if args.diff and not Path(args.dump).is_dir():
             parser.error(f"--diff requires an existing directory: {args.dump!r}")
         return
@@ -1606,6 +1674,17 @@ def _run_dump(
             return 2
         _report_diff(diff_envelope, args.json)
         return 0 if diff_envelope["identical"] else 1
+    if args.dump_manifest_only:
+        manifest_envelope = dump_manifest_only(
+            client,
+            selected,
+            Path(args.dump),
+            categories,
+            args.dump_secrets,
+            list(argv) if argv is not None else sys.argv[1:],
+        )
+        _report_dump(manifest_envelope, args.json)
+        return _dump_exit_code(manifest_envelope)
     envelope = dump_configs(
         client,
         selected,

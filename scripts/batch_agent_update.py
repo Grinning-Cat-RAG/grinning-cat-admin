@@ -430,7 +430,9 @@ def _apply_operation(client: Any, agent: AgentOutput, operation: Operation, curr
         return reconcile_plugin(client, agent.agent_id, operation.name, operation.payload, active=current)
     if operation.kind == "settings":
         if operation.category == "plugins":
-            client.plugins.put_plugin_settings(operation.name, agent.agent_id, operation.payload)
+            client.plugins.put_plugin_settings(
+                operation.name, agent.agent_id, _deep_merge(current, operation.payload)
+            )
             return "merged"
         merge_factory_setting(
             client, operation.category, operation.name, operation.payload, agent.agent_id, current=current

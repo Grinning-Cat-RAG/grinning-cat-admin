@@ -166,6 +166,7 @@ class FakeClient:
             (agent_id, plugin_id): dict(values)
             for (agent_id, plugin_id), values in (plugin_settings or {}).items()
         }
+        self.plugin_settings_payloads = []
         self.toggle_noop = toggle_noop
         self.concurrency_guard = concurrency_guard
         self.disappearing_plugins = set(disappearing_plugins or ())
@@ -238,6 +239,7 @@ class FakeClient:
         if method_name == "put_plugin_settings":
             plugin_id, agent_id, values = args
             key = (agent_id, plugin_id)
+            self.plugin_settings_payloads.append((plugin_id, agent_id, dict(values)))
             merged = {**self.plugin_settings.get(key, {}), **values}
             self.plugin_settings[key] = merged
             return PluginSettingsOutput(name=plugin_id, value=merged)
@@ -737,6 +739,81 @@ def test_patch_file_writes_each_pair_once(tmp_path):
     ]
     assert client.calls_to("put_plugin_settings") == [("foo", "corso1", {"k": "v"})]
     assert client.calls_to("put_agent") == [("corso1", {"public": True, "name": "X"})]
+
+
+def test_set_plugin_dotted_key_deep_merges_nested_siblings():
+    client = FakeClient(
+        agents=[_agent("corso1")],
+        plugins={"corso1": {"foo": True}},
+        plugin_settings={("corso1", "foo"): {"options": {"a": 1, "b": 2}, "other": 1}},
+    )
+
+    rc = cli.main(
+        ["--agent", "corso", "--set", "plugins:foo:options.a=9", "--yes"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert client.plugin_settings_payloads == [
+        ("foo", "corso1", {"options": {"a": 9, "b": 2}, "other": 1})
+    ]
+    assert client.plugin_settings[("corso1", "foo")] == {"options": {"a": 9, "b": 2}, "other": 1}
+
+
+def test_patch_plugin_nested_dict_keeps_siblings(tmp_path):
+    patch_file = tmp_path / "patch.json"
+    patch_file.write_text(
+        json.dumps({"plugins": {"foo": {"options": {"a": 5}}}}),
+        encoding="utf-8",
+    )
+    client = FakeClient(
+        agents=[_agent("corso1")],
+        plugins={"corso1": {"foo": True}},
+        plugin_settings={("corso1", "foo"): {"options": {"a": 1, "b": 2}, "other": 1}},
+    )
+
+    rc = cli.main(["--agent", "corso", "--patch", str(patch_file), "--yes"], client_factory=lambda: client)
+
+    assert rc == 0
+    assert client.plugin_settings_payloads == [
+        ("foo", "corso1", {"options": {"a": 5, "b": 2}, "other": 1})
+    ]
+    assert client.plugin_settings[("corso1", "foo")] == {"options": {"a": 5, "b": 2}, "other": 1}
+
+
+def test_restore_writes_back_nested_plugin_settings_with_siblings(tmp_path):
+    client = FakeClient(
+        agents=[_agent("corso1")],
+        plugins={"corso1": {"foo": True}},
+        plugin_settings={("corso1", "foo"): {"options": {"a": 1, "b": 2}, "other": 1}},
+    )
+
+    first = cli.main(
+        [
+            "--agent",
+            "corso",
+            "--set",
+            "plugins:foo:options.a=9",
+            "--yes",
+            "--backup-out",
+            str(tmp_path),
+        ],
+        client_factory=lambda: client,
+    )
+    assert first == 0
+    assert client.plugin_settings[("corso1", "foo")] == {"options": {"a": 9, "b": 2}, "other": 1}
+
+    client.plugin_settings[("corso1", "foo")] = {"options": {"a": 9, "b": 7}, "other": 1}
+    client.calls.clear()
+    client.plugin_settings_payloads.clear()
+
+    second = cli.main(["--restore", str(tmp_path), "--yes"], client_factory=lambda: client)
+
+    assert second == 0
+    assert client.plugin_settings_payloads == [
+        ("foo", "corso1", {"options": {"a": 1, "b": 2}, "other": 1})
+    ]
+    assert client.plugin_settings[("corso1", "foo")] == {"options": {"a": 1, "b": 2}, "other": 1}
 
 
 def test_patch_and_set_are_coalesced(tmp_path):

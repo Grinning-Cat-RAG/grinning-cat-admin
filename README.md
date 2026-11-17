@@ -151,7 +151,7 @@ GRINNING_CAT_API_SECURE_CONNECTION=false
 ### How the patches are applied
 
 - `--plugin NAME=on|off` reconciles: it reads the active flag and toggles only when the current state differs, then verifies the result. The core endpoint flips the flag rather than setting it, so a repeated command never toggles twice.
-- `--llm` and `--set` do a read-merge-write, because the core replaces the whole settings value on PUT. Only the keys you pass change; everything else is preserved.
+- `--llm` and `--set` do a read-merge-write, because the core replaces the whole settings value on PUT. Only the keys you pass change; everything else is preserved, including plugin settings, whose server-side merge is shallow.
 - `--metadata` merges into the existing metadata dict, for the same reason.
 
 ### Safety

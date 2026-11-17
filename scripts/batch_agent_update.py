@@ -1437,12 +1437,14 @@ def _restore_operations(snapshot: dict[str, Any]) -> list[Operation]:
     return operations
 
 
-def _report(envelope: dict[str, Any], as_json: bool) -> None:
-    if as_json:
-        print(json.dumps(envelope, indent=2))
+def _report(envelope: dict[str, Any], as_yaml: bool) -> None:
+    if as_yaml:
+        print(yaml.safe_dump(envelope, sort_keys=False, default_flow_style=False, allow_unicode=True), end="")
         return
 
     for result in envelope["agents"]:
+        if result.get("created"):
+            print(f"[batch] agent={result['agent_id']} created=yes")
         for operation in result["ops"]:
             line = f"[batch] agent={result['agent_id']} op={operation['op']} result={operation['status']}"
             if operation["status"] == "failed":
@@ -1465,9 +1467,9 @@ def _exit_code(envelope: dict[str, Any]) -> int:
     return 0
 
 
-def _report_dump(envelope: dict[str, Any], as_json: bool) -> None:
-    if as_json:
-        print(json.dumps(envelope, indent=2))
+def _report_dump(envelope: dict[str, Any], as_yaml: bool) -> None:
+    if as_yaml:
+        print(yaml.safe_dump(envelope, sort_keys=False, default_flow_style=False, allow_unicode=True), end="")
         return
     for entry in envelope["agents"]:
         result = "ok" if entry["ok"] else "failed"
@@ -1484,9 +1486,9 @@ def _dump_exit_code(envelope: dict[str, Any]) -> int:
     return 0 if all(entry["ok"] for entry in envelope["agents"]) else 1
 
 
-def _report_diff(envelope: dict[str, Any], as_json: bool) -> None:
-    if as_json:
-        print(json.dumps(envelope, indent=2))
+def _report_diff(envelope: dict[str, Any], as_yaml: bool) -> None:
+    if as_yaml:
+        print(yaml.safe_dump(envelope, sort_keys=False, default_flow_style=False, allow_unicode=True), end="")
         return
     for entry in envelope["agents"]:
         result = "identical" if entry["identical"] else "different"
@@ -1635,9 +1637,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="apply the changes (default: dry-run)",
     )
     parser.add_argument(
-        "--json",
+        "--yaml",
         action="store_true",
-        help="print the plan as JSON",
+        help="print the result as YAML",
     )
     parser.add_argument(
         "--backup-out",
@@ -1795,7 +1797,7 @@ def _run_dump(
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 2
-        _report_diff(diff_envelope, args.json)
+        _report_diff(diff_envelope, args.yaml)
         return 0 if diff_envelope["identical"] else 1
     if args.dump_manifest_only:
         manifest_envelope = dump_manifest_only(
@@ -1806,7 +1808,7 @@ def _run_dump(
             args.dump_secrets,
             list(argv) if argv is not None else sys.argv[1:],
         )
-        _report_dump(manifest_envelope, args.json)
+        _report_dump(manifest_envelope, args.yaml)
         return _dump_exit_code(manifest_envelope)
     envelope = dump_configs(
         client,
@@ -1817,7 +1819,7 @@ def _run_dump(
         list(argv) if argv is not None else sys.argv[1:],
         args.max_workers,
     )
-    _report_dump(envelope, args.json)
+    _report_dump(envelope, args.yaml)
     return _dump_exit_code(envelope)
 
 
@@ -1912,9 +1914,9 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
         return ["create", *plan_ops] if agent_id in create_ids else plan_ops
 
     if not args.yes:
-        if args.json:
+        if args.yaml:
             print(
-                json.dumps(
+                yaml.safe_dump(
                     {
                         "dry_run": True,
                         "agents": [
@@ -1927,8 +1929,11 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
                         ],
                         "system_wide": [{"op": _operation_label(operation)} for operation in system_wide],
                     },
-                    indent=2,
-                )
+                    sort_keys=False,
+                    default_flow_style=False,
+                    allow_unicode=True,
+                ),
+                end="",
             )
         else:
             for agent in selected:
@@ -1951,7 +1956,7 @@ def main(argv: list[str] | None = None, client_factory=default_client_factory) -
         missing=missing,
         create=create_ids or None,
     )
-    _report(envelope, args.json)
+    _report(envelope, args.yaml)
     return _exit_code(envelope)
 
 

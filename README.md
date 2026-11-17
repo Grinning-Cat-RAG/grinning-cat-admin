@@ -129,7 +129,7 @@ GRINNING_CAT_API_SECURE_CONNECTION=false
 | `--set CATEGORY:NAME:KEY=VALUE` | patch one factory setting (repeatable) |
 | `--patch FILE` | YAML file (`.yml` or `.yaml`) with per-category patches and `active_plugins` |
 | `--yes` | apply the changes (default: dry-run) |
-| `--json` | print the plan as JSON |
+| `--yaml` | print the result as YAML |
 | `--backup-out DIR` | directory for the before-snapshot |
 | `--restore PATH` | restore a snapshot file or directory |
 | `--allow-system-wide` | allow system-wide categories such as embedder |

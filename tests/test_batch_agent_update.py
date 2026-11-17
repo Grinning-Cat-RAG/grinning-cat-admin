@@ -63,7 +63,7 @@ def test_help_lists_every_flag(capsys):
         "--set",
         "--patch",
         "--yes",
-        "--json",
+        "--yaml",
         "--backup-out",
         "--restore",
         "--allow-system-wide",
@@ -500,13 +500,13 @@ def test_dry_run_unknown_substring_exits_2(capsys):
     assert "zzz-not-present" in capsys.readouterr().err
 
 
-def test_dry_run_json_plan(capsys):
+def test_dry_run_yaml_plan(capsys):
     client = FakeClient(agents=[_agent("Corso1"), _agent("other")])
 
-    rc = cli.main(["--agent", "corso1", "--llm", "gpt-4={}", "--json"], client_factory=lambda: client)
+    rc = cli.main(["--agent", "corso1", "--llm", "gpt-4={}", "--yaml"], client_factory=lambda: client)
 
     assert rc == 2
-    payload = json.loads(capsys.readouterr().out)
+    payload = yaml.safe_load(capsys.readouterr().out)
     assert payload == {
         "dry_run": True,
         "agents": [{"agent": "Corso1", "ops": ["llm:gpt-4"], "metadata_keys": []}],
@@ -1049,16 +1049,16 @@ def test_max_workers_zero_exits_2(capsys):
     assert client.calls == []
 
 
-def test_yes_happy_path_json_report(capsys):
+def test_yes_happy_path_yaml_report(capsys):
     client = FakeClient(agents=[_agent("corso1", {"public": True})])
 
     rc = cli.main(
-        ["--agent", "corso", "--metadata", "label=b", "--yes", "--json"],
+        ["--agent", "corso", "--metadata", "label=b", "--yes", "--yaml"],
         client_factory=lambda: client,
     )
 
     assert rc == 0
-    payload = json.loads(capsys.readouterr().out)
+    payload = yaml.safe_load(capsys.readouterr().out)
     assert payload["summary"]["ok"] == 1
     assert payload["agents"][0]["agent_id"] == "corso1"
     assert payload["agents"][0]["ok"] is True
@@ -1143,7 +1143,7 @@ def test_system_wide_with_flag_runs_once_for_all_agents(capsys):
             "embedder:openai:key=x",
             "--allow-system-wide",
             "--yes",
-            "--json",
+            "--yaml",
         ],
         client_factory=lambda: client,
     )
@@ -1152,7 +1152,7 @@ def test_system_wide_with_flag_runs_once_for_all_agents(capsys):
     assert client.calls_to("put_embedder_settings") == [
         ("openai", {"model": "text-embedding-3-small", "key": "x"})
     ]
-    payload = json.loads(capsys.readouterr().out)
+    payload = yaml.safe_load(capsys.readouterr().out)
     assert payload["summary"]["ok"] == 3
     assert payload["system_wide"] == [{"op": "system:embedder:openai", "status": "ok", "detail": "merged"}]
 
@@ -1171,13 +1171,13 @@ def test_system_wide_failure_exits_1_without_touching_agents(capsys):
             "embedder:openai:key=x",
             "--allow-system-wide",
             "--yes",
-            "--json",
+            "--yaml",
         ],
         client_factory=lambda: client,
     )
 
     assert rc == 1
-    payload = json.loads(capsys.readouterr().out)
+    payload = yaml.safe_load(capsys.readouterr().out)
     assert payload["summary"] == {"selected": 2, "ok": 2, "failed": 0, "skipped": 0}
     assert payload["system_wide"][0]["status"] == "failed"
 
@@ -1194,16 +1194,16 @@ def test_dry_run_prints_the_system_wide_count(capsys):
     assert "system-wide: 1" in capsys.readouterr().out
 
 
-def test_dry_run_json_stays_an_array_with_system_wide(capsys):
+def test_dry_run_yaml_stays_an_array_with_system_wide(capsys):
     client = FakeClient(agents=[_agent("corso1")])
 
     rc = cli.main(
-        ["--agent", "corso", "--set", "embedder:openai:key=x", "--allow-system-wide", "--json"],
+        ["--agent", "corso", "--set", "embedder:openai:key=x", "--allow-system-wide", "--yaml"],
         client_factory=lambda: client,
     )
 
     assert rc == 2
-    payload = json.loads(capsys.readouterr().out)
+    payload = yaml.safe_load(capsys.readouterr().out)
     assert payload == {
         "dry_run": True,
         "agents": [{"agent": "corso1", "ops": [], "metadata_keys": []}],
@@ -1215,12 +1215,12 @@ def test_dry_run_plan_derives_metadata_keys_from_the_operations(capsys):
     client = FakeClient(agents=[_agent("corso1")])
 
     rc = cli.main(
-        ["--agent", "corso", "--set", "metadata:ignored:name=x", "--json"],
+        ["--agent", "corso", "--set", "metadata:ignored:name=x", "--yaml"],
         client_factory=lambda: client,
     )
 
     assert rc == 2
-    payload = json.loads(capsys.readouterr().out)
+    payload = yaml.safe_load(capsys.readouterr().out)
     assert payload["agents"] == [{"agent": "corso1", "ops": ["metadata"], "metadata_keys": ["name"]}]
     assert payload["system_wide"] == []
 
@@ -1299,15 +1299,15 @@ def test_max_workers_matches_sequential_results(capsys):
     parallel = FakeClient(agents=agents, concurrency_guard=True)
 
     rc1 = cli.main(
-        ["--agent", "corso", "--metadata", "label=b", "--yes", "--json", "--max-workers", "1"],
+        ["--agent", "corso", "--metadata", "label=b", "--yes", "--yaml", "--max-workers", "1"],
         client_factory=lambda: sequential,
     )
-    first = json.loads(capsys.readouterr().out)
+    first = yaml.safe_load(capsys.readouterr().out)
     rc4 = cli.main(
-        ["--agent", "corso", "--metadata", "label=b", "--yes", "--json", "--max-workers", "4"],
+        ["--agent", "corso", "--metadata", "label=b", "--yes", "--yaml", "--max-workers", "4"],
         client_factory=lambda: parallel,
     )
-    second = json.loads(capsys.readouterr().out)
+    second = yaml.safe_load(capsys.readouterr().out)
 
     assert (rc1, rc4) == (0, 0)
     assert first == second
@@ -1319,10 +1319,10 @@ def test_mixed_run_summary_counts_skipped_and_failed(capsys):
         plugins={"corso1": {"foo": True}, "corso2": {"foo": False}, "corso3": {}},
     )
 
-    rc = cli.main(["--agent", "corso", "--plugin", "foo=on", "--yes", "--json"], client_factory=lambda: client)
+    rc = cli.main(["--agent", "corso", "--plugin", "foo=on", "--yes", "--yaml"], client_factory=lambda: client)
 
     assert rc == 1
-    payload = json.loads(capsys.readouterr().out)
+    payload = yaml.safe_load(capsys.readouterr().out)
     assert payload["summary"] == {"selected": 3, "ok": 2, "failed": 1, "skipped": 1}
 
 
@@ -1340,14 +1340,14 @@ def test_ingestion_system_wide_merges_once(capsys):
             "ingestion:default:batch_size=8",
             "--allow-system-wide",
             "--yes",
-            "--json",
+            "--yaml",
         ],
         client_factory=lambda: client,
     )
 
     assert rc == 0
     assert client.calls_to("put_ingestion_settings") == [("default", {"engine": "core", "batch_size": 8})]
-    payload = json.loads(capsys.readouterr().out)
+    payload = yaml.safe_load(capsys.readouterr().out)
     assert payload["system_wide"] == [{"op": "system:ingestion:default", "status": "ok", "detail": "merged"}]
 
 
@@ -1359,12 +1359,12 @@ def test_llm_get_failure_fails_only_that_agent(capsys):
     )
 
     rc = cli.main(
-        ["--agent", "corso", "--llm", 'gpt-4={"temperature": 0.2}', "--yes", "--json"],
+        ["--agent", "corso", "--llm", 'gpt-4={"temperature": 0.2}', "--yes", "--yaml"],
         client_factory=lambda: client,
     )
 
     assert rc == 1
-    payload = json.loads(capsys.readouterr().out)
+    payload = yaml.safe_load(capsys.readouterr().out)
     by_id = {result["agent_id"]: result for result in payload["agents"]}
     assert by_id["corso1"]["ok"] is False
     assert by_id["corso2"]["ok"] is True
@@ -1491,16 +1491,16 @@ def test_snapshot_contains_metadata_llm_plugins_and_categories(tmp_path):
     assert snapshot["categories"] == {"chunking": {"default": {"chunk_size": 256}}}
 
 
-def test_json_report_for_a_failed_agent_carries_the_detail(capsys):
+def test_yaml_report_for_a_failed_agent_carries_the_detail(capsys):
     client = FakeClient(agents=[_agent("corso1")], updated_false={"corso1"})
 
     rc = cli.main(
-        ["--agent", "corso", "--metadata", "label=b", "--yes", "--json"],
+        ["--agent", "corso", "--metadata", "label=b", "--yes", "--yaml"],
         client_factory=lambda: client,
     )
 
     assert rc == 1
-    payload = json.loads(capsys.readouterr().out)
+    payload = yaml.safe_load(capsys.readouterr().out)
     assert payload["agents"][0]["ok"] is False
     failed = [operation for operation in payload["agents"][0]["ops"] if operation["status"] == "failed"]
     assert len(failed) == 1
@@ -1538,10 +1538,10 @@ def test_restore_of_a_missing_agent_fails_without_writes(tmp_path, capsys):
     capsys.readouterr()
 
     gone = FakeClient(agents=[])
-    rc = cli.main(["--restore", str(tmp_path), "--yes", "--json"], client_factory=lambda: gone)
+    rc = cli.main(["--restore", str(tmp_path), "--yes", "--yaml"], client_factory=lambda: gone)
 
     assert rc == 1
-    payload = json.loads(capsys.readouterr().out)
+    payload = yaml.safe_load(capsys.readouterr().out)
     assert payload["agents"][0]["ok"] is False
     assert payload["agents"][0]["error"] == "agent not found on the server"
     assert payload["summary"]["failed"] == 1
@@ -1670,7 +1670,7 @@ def test_duplicate_snapshots_are_applied_once(tmp_path, capsys):
     (tmp_path / "a.json").write_text(json.dumps(snapshot), encoding="utf-8")
     (tmp_path / "b.json").write_text(json.dumps(snapshot), encoding="utf-8")
 
-    rc = cli.main(["--restore", str(tmp_path), "--yes", "--json"], client_factory=lambda: client)
+    rc = cli.main(["--restore", str(tmp_path), "--yes", "--yaml"], client_factory=lambda: client)
 
     assert rc == 0
     assert client.calls_to("put_toggle_plugin") == [("foo", "corso1")]
@@ -1924,12 +1924,12 @@ def test_shipped_full_agent_example_produces_the_expected_operations(capsys):
     client = FakeClient(agents=[_agent("corso1")])
 
     rc = cli.main(
-        ["--agent", "corso", "--patch", str(EXAMPLES_DIR / "patch-full-agent.yml"), "--json"],
+        ["--agent", "corso", "--patch", str(EXAMPLES_DIR / "patch-full-agent.yml"), "--yaml"],
         client_factory=lambda: client,
     )
 
     assert rc == 2
-    plan = json.loads(capsys.readouterr().out)
+    plan = yaml.safe_load(capsys.readouterr().out)
     assert plan["agents"][0]["ops"] == [
         "metadata",
         "plugin:my_plugin",
@@ -2497,14 +2497,14 @@ def test_main_dump_failure_exits_1(tmp_path, capsys):
     assert "reason=" in out
 
 
-def test_main_dump_json_envelope(tmp_path, capsys):
+def test_main_dump_yaml_envelope(tmp_path, capsys):
     agents = [_agent("corso")]
     client = FakeClient(agents=agents, factory_lists=_full_factory_lists("corso"))
 
-    rc = cli.main(["--dump", str(tmp_path), "--all", "--json"], client_factory=lambda: client)
+    rc = cli.main(["--dump", str(tmp_path), "--all", "--yaml"], client_factory=lambda: client)
 
     assert rc == 0
-    data = json.loads(capsys.readouterr().out)
+    data = yaml.safe_load(capsys.readouterr().out)
     assert data["summary"] == {"selected": 2, "ok": 2, "failed": 0}
     assert data["agents"][0]["agent_id"] == "corso"
     assert data["agents"][1]["agent_id"] == "system"
@@ -2768,19 +2768,19 @@ def test_diff_corrupt_file_exits_2(tmp_path, capsys):
     assert "bad.yml" in capsys.readouterr().err
 
 
-def test_diff_json_envelope(tmp_path, capsys):
+def test_diff_yaml_envelope(tmp_path, capsys):
     agents = [_agent("corso")]
     client = FakeClient(agents=agents, factory_lists=_full_factory_lists("corso"))
     assert _dump_once(tmp_path, client) == 0
     capsys.readouterr()
 
     rc = cli.main(
-        ["--dump", str(tmp_path), "--all", "--diff", "--json"],
+        ["--dump", str(tmp_path), "--all", "--diff", "--yaml"],
         client_factory=lambda: client,
     )
 
     assert rc == 0
-    data = json.loads(capsys.readouterr().out)
+    data = yaml.safe_load(capsys.readouterr().out)
     assert data["identical"] is True
     assert data["agents"][0]["agent_id"] == "corso"
     assert data["agents"][0]["identical"] is True
@@ -3467,16 +3467,16 @@ def test_dry_run_plan_marks_a_missing_agent_for_creation(capsys):
     assert client.calls_to("post_agent_create") == []
 
 
-def test_dry_run_json_plan_marks_a_missing_agent_for_creation(capsys):
+def test_dry_run_yaml_plan_marks_a_missing_agent_for_creation(capsys):
     client = FakeClient(agents=[_agent("corso1")])
 
     rc = cli.main(
-        ["--agent", "nuovo", "--create-missing", "--metadata", "label=qa", "--json"],
+        ["--agent", "nuovo", "--create-missing", "--metadata", "label=qa", "--yaml"],
         client_factory=lambda: client,
     )
 
     assert rc == 2
-    payload = json.loads(capsys.readouterr().out)
+    payload = yaml.safe_load(capsys.readouterr().out)
     assert payload["agents"] == [
         {"agent": "nuovo", "ops": ["create", "metadata"], "metadata_keys": ["label"]}
     ]
@@ -3495,13 +3495,13 @@ def test_yes_creates_then_applies_operations(tmp_path, capsys):
             "--yes",
             "--backup-out",
             str(tmp_path),
-            "--json",
+            "--yaml",
         ],
         client_factory=lambda: client,
     )
 
     assert rc == 0
-    payload = json.loads(capsys.readouterr().out)
+    payload = yaml.safe_load(capsys.readouterr().out)
     entry = payload["agents"][0]
     assert entry["created"] is True
     assert entry["ok"] is True
@@ -3510,6 +3510,33 @@ def test_yes_creates_then_applies_operations(tmp_path, capsys):
     names = [name for name, _args in client.calls]
     assert names.index("post_agent_create") < names.index("put_agent")
     assert _snapshot_files(tmp_path) == []
+
+
+def test_human_report_marks_created_agents(tmp_path, capsys):
+    client = FakeClient(agents=[_agent("corso1")])
+
+    rc = cli.main(
+        [
+            "--agent",
+            "nuovo",
+            "--agent",
+            "corso",
+            "--create-missing",
+            "--metadata",
+            "label=qa",
+            "--yes",
+            "--backup-out",
+            str(tmp_path),
+        ],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    created = [line for line in lines if line.startswith("[batch] agent=nuovo ")]
+    assert created[0] == "[batch] agent=nuovo created=yes"
+    assert created[1].startswith("[batch] agent=nuovo op=metadata result=ok")
+    assert not any("created=" in line for line in lines if line.startswith("[batch] agent=corso1 "))
 
 
 def test_created_false_fails_only_that_agent(capsys):
@@ -3525,13 +3552,13 @@ def test_created_false_fails_only_that_agent(capsys):
             "--metadata",
             "label=qa",
             "--yes",
-            "--json",
+            "--yaml",
         ],
         client_factory=lambda: client,
     )
 
     assert rc == 1
-    payload = json.loads(capsys.readouterr().out)
+    payload = yaml.safe_load(capsys.readouterr().out)
     by_id = {entry["agent_id"]: entry for entry in payload["agents"]}
     assert by_id["nuovo"]["ok"] is False
     assert by_id["nuovo"]["created"] is False
@@ -3572,12 +3599,12 @@ def test_restore_create_missing_creates_then_restores(tmp_path, capsys):
 
     gone = FakeClient(agents=[])
     rc = cli.main(
-        ["--restore", str(tmp_path), "--create-missing", "--yes", "--json"],
+        ["--restore", str(tmp_path), "--create-missing", "--yes", "--yaml"],
         client_factory=lambda: gone,
     )
 
     assert rc == 0
-    payload = json.loads(capsys.readouterr().out)
+    payload = yaml.safe_load(capsys.readouterr().out)
     assert payload["agents"][0]["created"] is True
     assert gone.calls_to("post_agent_create") == [("corso1", {"public": True})]
     assert gone.calls_to("put_agent") == [("corso1", {"public": True})]

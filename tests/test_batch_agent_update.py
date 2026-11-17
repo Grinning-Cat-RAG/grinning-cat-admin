@@ -8,6 +8,7 @@ import importlib.util
 import json
 import sys
 import threading
+from argparse import Namespace
 from pathlib import Path
 
 import pytest
@@ -1565,3 +1566,174 @@ def test_duplicate_snapshots_are_applied_once(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "duplicate" in err
     assert "corso1" in err
+
+
+def test_strip_jsonc_preserves_comment_like_string_contents():
+    raw = (
+        '{"url": "http://x", "block": "a /* b */", '
+        '"escaped": "escaped \\" // not a comment",}\n'
+        "// a real line comment\n"
+    )
+
+    stripped = cli._strip_jsonc(raw)
+
+    assert '"http://x"' in stripped
+    assert '"a /* b */"' in stripped
+    assert '"escaped \\" // not a comment"' in stripped
+    assert "a real line comment" not in stripped
+    assert json.loads(stripped) == {
+        "url": "http://x",
+        "block": "a /* b */",
+        "escaped": 'escaped " // not a comment',
+    }
+
+
+def test_patch_file_accepts_jsonc_comments_and_trailing_commas(tmp_path):
+    patch_file = tmp_path / "patch.jsonc"
+    patch_file.write_text(
+        """{
+  // the model to use
+  "llm": {
+    "gpt-4": {
+      "temperature": 0.2, /* keep the model name untouched */
+    },
+  },
+}""",
+        encoding="utf-8",
+    )
+    client = FakeClient(
+        agents=[_agent("corso1")],
+        settings={("large_language_model", "gpt-4"): {"model": "gpt-4"}},
+    )
+
+    rc = cli.main(["--agent", "corso", "--patch", str(patch_file), "--yes"], client_factory=lambda: client)
+
+    assert rc == 0
+    assert client.calls_to("put_large_language_model_settings") == [
+        ("gpt-4", "corso1", {"model": "gpt-4", "temperature": 0.2})
+    ]
+
+
+def test_active_plugins_toggle_on_and_off_idempotently(tmp_path):
+    patch_file = tmp_path / "patch.jsonc"
+    patch_file.write_text(
+        '{"active_plugins": {"foo": true, "bar": false}}',
+        encoding="utf-8",
+    )
+    client = FakeClient(
+        agents=[_agent("corso1")],
+        plugins={"corso1": {"foo": False, "bar": True}},
+    )
+
+    first = cli.main(["--agent", "corso", "--patch", str(patch_file), "--yes"], client_factory=lambda: client)
+    second = cli.main(["--agent", "corso", "--patch", str(patch_file), "--yes"], client_factory=lambda: client)
+
+    assert (first, second) == (0, 0)
+    assert sorted(client.calls_to("put_toggle_plugin")) == [("bar", "corso1"), ("foo", "corso1")]
+    assert client.plugin_states["corso1"] == {"foo": True, "bar": False}
+
+
+def test_cli_plugin_beats_active_plugins_in_the_operation_payload(tmp_path):
+    patch_file = tmp_path / "patch.jsonc"
+    patch_file.write_text(
+        '{"active_plugins": {"foo": false, "bar": true}}',
+        encoding="utf-8",
+    )
+
+    args = Namespace(
+        patch=str(patch_file),
+        set=[],
+        metadata=[],
+        name=None,
+        llm=[],
+        plugin=["foo=on"],
+        allow_system_wide=False,
+    )
+
+    operations, system_wide = cli._build_operations(args)
+
+    plugin_ops = [(operation.name, operation.payload) for operation in operations if operation.kind == "plugin"]
+    assert plugin_ops == [("foo", True), ("bar", True)]
+    assert system_wide == []
+    assert not [
+        operation for operation in operations if operation.kind == "settings" and operation.category == "active_plugins"
+    ]
+
+
+def test_cli_plugin_beats_active_plugins_when_applied(tmp_path):
+    patch_file = tmp_path / "patch.jsonc"
+    patch_file.write_text('{"active_plugins": {"foo": false}}', encoding="utf-8")
+    client = FakeClient(agents=[_agent("corso1")], plugins={"corso1": {"foo": False}})
+
+    rc = cli.main(
+        ["--agent", "corso", "--patch", str(patch_file), "--plugin", "foo=on", "--yes"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 0
+    assert client.calls_to("put_toggle_plugin") == [("foo", "corso1")]
+    assert client.plugin_states["corso1"]["foo"] is True
+
+
+def test_active_plugins_non_bool_exits_2_without_calls(tmp_path, capsys):
+    patch_file = tmp_path / "patch.jsonc"
+    patch_file.write_text('{"active_plugins": {"foo": "on"}}', encoding="utf-8")
+    client = FakeClient(agents=[_agent("corso1")])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--agent", "corso", "--patch", str(patch_file), "--yes"], client_factory=lambda: client)
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "active_plugins" in err
+    assert "foo" in err
+    assert "boolean" in err
+    assert client.calls == []
+
+
+EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
+
+
+def test_shipped_llm_example_loads_through_load_patch():
+    patches, active_plugins = cli.load_patch(str(EXAMPLES_DIR / "patch-llm-openrouter.jsonc"))
+
+    assert set(patches) == {("llm", "openrouter")}
+    assert patches[("llm", "openrouter")]["model"] == "anthropic/claude-3.5-sonnet"
+    assert active_plugins == {}
+
+
+def test_shipped_full_agent_example_loads_through_load_patch():
+    patches, active_plugins = cli.load_patch(str(EXAMPLES_DIR / "patch-full-agent.jsonc"))
+
+    assert set(patches) == {
+        ("metadata", ""),
+        ("llm", "openrouter"),
+        ("chunking", "default"),
+        ("plugins", "my_plugin"),
+        ("plugins", "other_plugin"),
+    }
+    assert patches[("metadata", "")] == {"name": "Corso 1", "label": "production", "owner": "didattica"}
+    assert active_plugins == {"my_plugin": True, "other_plugin": False}
+
+
+def test_shipped_full_agent_example_produces_the_expected_operations(capsys):
+    client = FakeClient(agents=[_agent("corso1")])
+
+    rc = cli.main(
+        ["--agent", "corso", "--patch", str(EXAMPLES_DIR / "patch-full-agent.jsonc"), "--json"],
+        client_factory=lambda: client,
+    )
+
+    assert rc == 2
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["agents"][0]["ops"] == [
+        "metadata",
+        "plugin:my_plugin",
+        "plugin:other_plugin",
+        "settings:llm:openrouter",
+        "settings:chunking:default",
+        "settings:plugins:my_plugin",
+        "settings:plugins:other_plugin",
+    ]
+    assert plan["agents"][0]["metadata_keys"] == ["label", "name", "owner"]
+    assert client.calls == [("get_agents", ())]

@@ -260,23 +260,92 @@ def parse_set(items: list[str]) -> dict[tuple[str, str], dict[str, Any]]:
     return patches
 
 
-def load_patch(path: str) -> dict[tuple[str, str], dict[str, Any]]:
-    """Load a ``{category: {name: patch}}`` JSON file into per-target patches."""
+def _strip_jsonc(text: str) -> str:
+    """Strip JSONC comments and trailing commas, string-safely, in one pass.
+
+    ``//`` and ``/* */`` comments are removed and a comma directly before a
+    closing ``}`` or ``]`` is dropped. Comment markers inside a JSON string are
+    data, and an escaped quote (``\\"``) does not end the string. Comments become
+    whitespace (newlines preserved), so a JSON error still points near the
+    original line.
+    """
+    out: list[str] = []
+    index = 0
+    length = len(text)
+    in_string = False
+    while index < length:
+        char = text[index]
+        if in_string:
+            out.append(char)
+            if char == "\\" and index + 1 < length:
+                out.append(text[index + 1])
+                index += 2
+                continue
+            if char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            out.append(char)
+            index += 1
+            continue
+        if text.startswith("//", index):
+            index += 2
+            while index < length and text[index] not in "\r\n":
+                index += 1
+            continue
+        if text.startswith("/*", index):
+            out.append(" ")
+            index += 2
+            while index < length and not text.startswith("*/", index):
+                if text[index] in "\r\n":
+                    out.append(text[index])
+                index += 1
+            index += 2
+            continue
+        if char in "}]":
+            end = len(out)
+            while end and out[end - 1].isspace():
+                end -= 1
+            if end and out[end - 1] == ",":
+                del out[end - 1]
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def load_patch(path: str) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, bool]]:
+    """Load a JSONC patch file into per-target patches and ``active_plugins``.
+
+    The file is a ``{category: {name: patch}}`` object with one extra top-level
+    key, ``active_plugins``: ``{name: true|false}``. Comments and trailing
+    commas are allowed. Returns ``(patches, active_plugins)``.
+    """
     try:
         raw = Path(path).read_text(encoding="utf-8")
     except OSError as exc:
         raise ValueError(f"cannot read --patch {path!r}: {exc}") from None
     try:
-        data = json.loads(raw)
+        data = json.loads(_strip_jsonc(raw))
     except json.JSONDecodeError as exc:
         raise ValueError(f"invalid JSON in --patch {path!r}: {exc}") from None
     if not isinstance(data, dict):
         raise ValueError(f"invalid --patch {path!r}: the top level must be a JSON object")
 
     patches: dict[tuple[str, str], dict[str, Any]] = {}
+    active_plugins: dict[str, bool] = {}
     for category, entries in data.items():
         if not isinstance(entries, dict):
             raise ValueError(f"invalid --patch {path!r}: category {category!r} must be an object")
+        if category == "active_plugins":
+            for name, desired in entries.items():
+                if not isinstance(desired, bool):
+                    raise ValueError(
+                        f"invalid --patch {path!r}: active_plugins:{name} must be a boolean (true or false)"
+                    )
+                active_plugins[name] = desired
+            continue
         if category == "metadata":
             patches[("metadata", "")] = dict(entries)
             continue
@@ -284,7 +353,7 @@ def load_patch(path: str) -> dict[tuple[str, str], dict[str, Any]]:
             if not isinstance(patch, dict):
                 raise ValueError(f"invalid --patch {path!r}: {category}:{name} must be an object")
             patches[(category, name)] = patch
-    return patches
+    return patches, active_plugins
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -319,7 +388,7 @@ def _build_operations(args: argparse.Namespace) -> tuple[list[Operation], list[O
     Returns ``(per_agent, system_wide)``: system-wide categories are applied
     once for the whole deployment, never once per selected agent.
     """
-    patches = load_patch(args.patch) if args.patch else {}
+    patches, file_plugins = load_patch(args.patch) if args.patch else ({}, {})
     for key, patch in parse_set(args.set or []).items():
         patches[key] = _deep_merge(patches.get(key, {}), patch)
 
@@ -339,8 +408,14 @@ def _build_operations(args: argparse.Namespace) -> tuple[list[Operation], list[O
         operations.append(Operation(kind="metadata", name="", payload=metadata_payload))
     for model, patch in parse_llm(args.llm or []):
         operations.append(Operation(kind="llm", name=model, payload=patch))
-    for name, desired in parse_plugins(args.plugin or []):
+    cli_plugins = parse_plugins(args.plugin or [])
+    for name, desired in cli_plugins:
         operations.append(Operation(kind="plugin", name=name, payload=desired))
+    # An explicit --plugin WINS over the same name in the patch file.
+    cli_plugin_names = {name for name, _desired in cli_plugins}
+    for name, desired in file_plugins.items():
+        if name not in cli_plugin_names:
+            operations.append(Operation(kind="plugin", name=name, payload=desired))
     for (category, name), patch in patches.items():
         if category == "metadata":
             continue
@@ -809,7 +884,7 @@ examples:
   # 2. Set api_key of an LLM configuration; any other key (temperature, base_url, ...) works the same way.
   uv run python scripts/batch_agent_update.py --agent corso --set llm:openrouter:api_key=sk-...
   #    For a secret that must not land in shell history, keep it in a patch file instead:
-  uv run python scripts/batch_agent_update.py --agent corso --patch examples/patch.json
+  uv run python scripts/batch_agent_update.py --agent corso --patch examples/patch-llm-openrouter.jsonc
 
   # 3. Add or overwrite an agent metadata key; --name is the shortcut for --metadata name=VALUE.
   #    Metadata keys are literal: dotted nesting is only available through --set.
@@ -825,8 +900,15 @@ examples:
   uv run python scripts/batch_agent_update.py --agent corso --set plugins:my_plugin:options.enabled=true
 
   # 6. Everything else.
-  #    A patch file carries the full shape: {"llm": {...}, "plugins": {...}, "metadata": {...}}.
-  uv run python scripts/batch_agent_update.py --agent corso --patch examples/patch.json
+  #    A patch file is JSONC and carries the full shape: {"metadata": {...}, "llm": {...},
+  #    "chunking": {...}, "plugins": {...}, "active_plugins": {...}}.
+  #    It accepts // and /* */ comments and trailing commas. Copy and adapt:
+  #      examples/patch-llm-openrouter.jsonc  one LLM change on OpenRouter
+  #      examples/patch-full-agent.jsonc      metadata + all settings + active_plugins
+  #    "active_plugins": {"my_plugin": true} reconciles like --plugin, and an explicit
+  #    --plugin NAME=on|off on the command line wins over the same name in the file.
+  uv run python scripts/batch_agent_update.py --agent corso --patch examples/patch-full-agent.jsonc
+  uv run python scripts/batch_agent_update.py --agent corso --patch examples/patch-llm-openrouter.jsonc
   #    Several agents at once, minus the test ones.
   uv run python scripts/batch_agent_update.py --agent corso --agent lab --exclude test --metadata label=production
   #    Every non-system agent, writing with a before-snapshot.
@@ -898,7 +980,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--patch",
         metavar="FILE",
-        help="JSON file with per-category patches",
+        help="JSONC file with per-category patches and active_plugins",
     )
     parser.add_argument(
         "--yes",

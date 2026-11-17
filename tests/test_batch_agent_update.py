@@ -14,7 +14,10 @@ from pathlib import Path
 import pytest
 
 from grinning_cat_python_sdk.models.api.admins import AgentOutput, AgentUpdatedOutput
-from grinning_cat_python_sdk.models.api.factories import FactoryObjectSettingOutput
+from grinning_cat_python_sdk.models.api.factories import (
+    FactoryObjectSettingOutput,
+    FactoryObjectSettingsOutput,
+)
 from grinning_cat_python_sdk.models.api.nested.plugins import PluginSettingsOutput
 from grinning_cat_python_sdk.models.api.plugins import PluginToggleOutput
 
@@ -234,6 +237,19 @@ class FakePluginCollection:
         self.installed = installed
 
 
+_LIST_GETTER_ATTRIBUTES = {
+    "get_large_language_models_settings": "large_language_model",
+    "get_chunkers_settings": "chunker",
+    "get_vector_databases_settings": "vector_database",
+    "get_auth_handlers_settings": "auth_handler",
+    "get_agentic_workflows_settings": "agentic_workflow",
+    "get_context_retrievers_settings": "context_retriever",
+    "get_file_managers_settings": "file_manager",
+    "get_embedders_settings": "embedder",
+    "get_ingestions_settings": "ingestion",
+}
+
+
 class FakeClient:
     """In-memory stand-in for ``GrinningCatClient``: no network, no Redis."""
 
@@ -248,6 +264,7 @@ class FakeClient:
         plugin_settings=None,
         concurrency_guard=False,
         disappearing_plugins=None,
+        factory_lists=None,
     ):
         self.calls = []
         self.agents = list(agents or [])
@@ -263,6 +280,7 @@ class FakeClient:
         self.toggle_noop = toggle_noop
         self.concurrency_guard = concurrency_guard
         self.disappearing_plugins = set(disappearing_plugins or ())
+        self.factory_lists = dict(factory_lists or {})
         self._agent_locks = {}
         self._agent_ids = {agent.agent_id for agent in self.agents}
         for attribute in (
@@ -324,6 +342,10 @@ class FakeClient:
             if plugin_id in self.disappearing_plugins:
                 state.pop(plugin_id, None)
             return PluginToggleOutput(info="toggled")
+        if method_name in _LIST_GETTER_ATTRIBUTES:
+            attribute = _LIST_GETTER_ATTRIBUTES[method_name]
+            agent_id = args[0] if args else None
+            return self.factory_lists[(attribute, agent_id)]
         if method_name == "get_plugin_settings":
             plugin_id, agent_id = args
             return FactoryObjectSettingOutput(
@@ -2087,3 +2109,141 @@ def test_select_agents_include_internal_still_applies_exclude():
 )
 def test_agent_role(agent_id, role):
     assert cli._agent_role(agent_id) == role
+
+
+# --- Todo 3: read the full configuration through the SDK -------------------
+
+
+def _factory_list(selected, values):
+    return FactoryObjectSettingsOutput(
+        settings=[
+            FactoryObjectSettingOutput(name=name, value=value) for name, value in values.items()
+        ],
+        selected_configuration=selected,
+    )
+
+
+def test_read_factory_selected_returns_the_selected_value():
+    client = FakeClient(
+        factory_lists={
+            ("large_language_model", "corso"): _factory_list(
+                "LLMOpenRouterConfig",
+                {"LLMOpenRouterConfig": {"model": "x"}, "Other": {"model": "y"}},
+            )
+        }
+    )
+
+    name, value = cli._read_factory_selected(client, "llm", "corso")
+
+    assert name == "LLMOpenRouterConfig"
+    assert value == {"model": "x"}
+
+
+def test_read_factory_selected_without_a_selection_raises():
+    client = FakeClient(
+        factory_lists={("large_language_model", "corso"): _factory_list("", {"A": {}})}
+    )
+
+    with pytest.raises(ValueError, match="no selected configuration for llm on corso"):
+        cli._read_factory_selected(client, "llm", "corso")
+
+
+def test_read_factory_selected_with_a_missing_name_raises():
+    client = FakeClient(
+        factory_lists={("large_language_model", "corso"): _factory_list("Missing", {"A": {}})}
+    )
+
+    with pytest.raises(ValueError, match="no selected configuration for llm on corso"):
+        cli._read_factory_selected(client, "llm", "corso")
+
+
+def test_read_factory_selected_reads_system_wide_categories():
+    client = FakeClient(
+        factory_lists={
+            ("embedder", None): _factory_list("OpenAIEmbedder", {"OpenAIEmbedder": {"api_key": "sk-1"}}),
+            ("ingestion", None): _factory_list("Ingestion", {"Ingestion": {"batch": 10}}),
+        }
+    )
+
+    assert cli._read_factory_selected(client, "embedder", None) == (
+        "OpenAIEmbedder",
+        {"api_key": "sk-1"},
+    )
+    assert cli._read_factory_selected(client, "ingestion", None) == ("Ingestion", {"batch": 10})
+
+
+def test_read_factory_selected_rejects_a_system_wide_category_with_an_agent():
+    client = FakeClient()
+
+    with pytest.raises(ValueError, match="system-wide"):
+        cli._read_factory_selected(client, "embedder", "corso")
+
+
+def test_strip_secrets_omits_secret_keys_recursively():
+    value = {
+        "api_key": "sk-1",
+        "API-KEY": "sk-2",
+        "nested": {"password": "p", "model": "m"},
+        "items": [{"token": "t", "keep": 1}],
+        "secret": "s",
+    }
+
+    assert cli._strip_secrets(value) == {"nested": {"model": "m"}, "items": [{"keep": 1}]}
+
+
+def test_dump_agent_config_reads_every_requested_category():
+    client = FakeClient(
+        factory_lists={
+            ("large_language_model", "corso"): _factory_list(
+                "LLMOpenRouterConfig", {"LLMOpenRouterConfig": {"model": "m", "api_key": "sk-1"}}
+            ),
+            ("chunker", "corso"): _factory_list("Chunker", {"Chunker": {"chunk_size": 100}}),
+        },
+        plugins={"corso": {"foo": True, "bar": False}},
+        plugin_settings={("corso", "foo"): {"opt": 1}},
+    )
+
+    payload = cli._dump_agent_config(
+        client,
+        _agent("corso", {"name": "Corso"}),
+        ["metadata", "llm", "chunking", "plugins", "active_plugins"],
+        include_secrets=False,
+    )
+
+    assert payload["metadata"] == {"name": "Corso"}
+    assert payload["llm"] == {"LLMOpenRouterConfig": {"model": "m"}}
+    assert payload["chunking"] == {"Chunker": {"chunk_size": 100}}
+    assert payload["plugins"] == {"foo": {"opt": 1}, "bar": {}}
+    assert payload["active_plugins"] == {"foo": "on", "bar": "off"}
+
+
+def test_dump_agent_config_system_includes_embedder_and_ingestion():
+    client = FakeClient(
+        factory_lists={
+            ("embedder", None): _factory_list("OpenAIEmbedder", {"OpenAIEmbedder": {"api_key": "sk-1"}}),
+            ("ingestion", None): _factory_list("Ingestion", {"Ingestion": {"batch": 10}}),
+        }
+    )
+
+    payload = cli._dump_agent_config(
+        client, _agent("system"), ["embedder", "ingestion"], include_secrets=False
+    )
+
+    assert payload["embedder"] == {"OpenAIEmbedder": {}}
+    assert payload["ingestion"] == {"Ingestion": {"batch": 10}}
+
+
+def test_dump_agent_config_keeps_secrets_when_requested():
+    client = FakeClient(
+        factory_lists={
+            ("large_language_model", "corso"): _factory_list(
+                "LLMOpenRouterConfig", {"LLMOpenRouterConfig": {"api_key": "sk-1"}}
+            )
+        }
+    )
+
+    payload = cli._dump_agent_config(
+        client, _agent("corso"), ["llm"], include_secrets=True
+    )
+
+    assert payload["llm"]["LLMOpenRouterConfig"]["api_key"] == "sk-1"

@@ -211,6 +211,29 @@ _OPERATION_ORDER = {"metadata": 0, "llm": 1, "plugin": 2, "settings": 3}
 _PLUGIN_STATES = {"on": True, "true": True, "1": True, "off": False, "false": False, "0": False}
 _YAML_SUFFIXES = {".yml", ".yaml"}
 
+#: ``category -> (client attribute, list getter)`` for the per-agent factories.
+FACTORY_LIST_GETTERS = {
+    "llm": ("large_language_model", "get_large_language_models_settings"),
+    "chunking": ("chunker", "get_chunkers_settings"),
+    "vector_database": ("vector_database", "get_vector_databases_settings"),
+    "auth_handler": ("auth_handler", "get_auth_handlers_settings"),
+    "agentic_workflow": ("agentic_workflow", "get_agentic_workflows_settings"),
+    "context_retriever": ("context_retriever", "get_context_retrievers_settings"),
+    "file_manager": ("file_manager", "get_file_managers_settings"),
+}
+
+#: Every category a dump can contain, in the order the header lists them.
+DUMP_CATEGORIES = [
+    "metadata",
+    *FACTORY_LIST_GETTERS,
+    "plugins",
+    "active_plugins",
+    "embedder",
+    "ingestion",
+]
+
+_SECRET_KEY = re.compile(r"(api[_-]?key|secret|password|token)", re.IGNORECASE)
+
 
 def _parse_value(raw: str) -> Any:
     """Decode a CLI value as JSON, falling back to the raw string."""
@@ -574,6 +597,86 @@ def _read_operation_state(client: Any, agent: AgentOutput, operation: Operation)
         endpoint = getattr(client, attribute)
         return dict(getattr(endpoint, getter_name)(operation.name, agent.agent_id).value)
     raise NotImplementedError(f"operation {operation.kind!r} is not implemented yet")
+
+
+def _read_factory_selected(
+    client: Any, category: str, agent_id: str | None
+) -> tuple[str, dict[str, Any]]:
+    """Read the *selected* configuration of one factory category.
+
+    Only the selected configuration is dumped: the core's
+    ``PUT /<category>/settings/{name}`` selects that name, so dumping the
+    alternatives too would turn a reload into a silent selection change.
+    """
+    if category in FACTORY_LIST_GETTERS:
+        attribute, getter_name = FACTORY_LIST_GETTERS[category]
+        response = getattr(getattr(client, attribute), getter_name)(agent_id)
+    elif category in SYSTEM_WIDE_CATEGORIES:
+        if agent_id is not None:
+            raise ValueError(f"{category} is system-wide and cannot be read per agent")
+        getter_name = (
+            "get_embedders_settings" if category == "embedder" else "get_ingestions_settings"
+        )
+        response = getattr(getattr(client, category), getter_name)()
+    else:
+        raise ValueError(f"unknown factory category {category!r}")
+
+    selected = getattr(response, "selected_configuration", "") or ""
+    if selected:
+        for setting in response.settings:
+            if setting.name == selected:
+                return selected, dict(setting.value)
+    raise ValueError(f"no selected configuration for {category} on {agent_id or 'system'}")
+
+
+def _strip_secrets(value: Any) -> Any:
+    """Drop secret-looking keys at every level; never substitute a placeholder."""
+    if isinstance(value, dict):
+        return {
+            key: _strip_secrets(item)
+            for key, item in value.items()
+            if not _SECRET_KEY.search(str(key))
+        }
+    if isinstance(value, list):
+        return [_strip_secrets(item) for item in value]
+    return value
+
+
+def _dump_agent_config(
+    client: Any,
+    agent: AgentOutput,
+    categories: list[str],
+    include_secrets: bool,
+) -> dict[str, Any]:
+    """Build the patch-shaped payload for one agent from the live SDK state."""
+    role = _agent_role(agent.agent_id)
+    payload: dict[str, Any] = {}
+    if "metadata" in categories:
+        payload["metadata"] = dict(agent.metadata)
+    for category in categories:
+        if category in FACTORY_LIST_GETTERS:
+            name, value = _read_factory_selected(client, category, agent.agent_id)
+            payload[category] = {name: value}
+    if role == "system":
+        for category in ("embedder", "ingestion"):
+            if category in categories:
+                name, value = _read_factory_selected(client, category, None)
+                payload[category] = {name: value}
+    if "plugins" in categories:
+        collection = client.plugins.get_available_plugins(agent.agent_id)
+        payload["plugins"] = {
+            plugin.id: dict(client.plugins.get_plugin_settings(plugin.id, agent.agent_id).value)
+            for plugin in collection.installed
+        }
+    if "active_plugins" in categories:
+        collection = client.plugins.get_available_plugins(agent.agent_id)
+        payload["active_plugins"] = {
+            plugin.id: "on" if plugin.local_info.get("active") else "off"
+            for plugin in collection.installed
+        }
+    if not include_secrets:
+        payload = _strip_secrets(payload)
+    return payload
 
 
 def _build_snapshot(

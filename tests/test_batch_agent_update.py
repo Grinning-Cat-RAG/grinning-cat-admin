@@ -2588,3 +2588,75 @@ def test_dump_header_categories_exclude_system_wide_for_agents(tmp_path):
     categories_line = next(line for line in header if line.startswith("# categories: "))
     assert "embedder" not in categories_line
     assert "ingestion" not in categories_line
+
+
+# --- Todo 7: secret policy and warnings ------------------------------------
+
+
+def test_count_secret_keys_counts_recursively():
+    value = {
+        "api_key": "x",
+        "nested": {"password": "p", "model": "m"},
+        "items": [{"token": "t", "keep": 1}],
+    }
+
+    assert cli._count_secret_keys(value) == 3
+
+
+def test_dump_agent_config_counts_omitted_secrets():
+    client = FakeClient(
+        factory_lists={
+            ("large_language_model", "corso"): _factory_list(
+                "LLMOpenRouterConfig", {"LLMOpenRouterConfig": {"api_key": "sk-1", "model": "m"}}
+            )
+        }
+    )
+    stats = {"omitted": 0}
+
+    payload = cli._dump_agent_config(client, _agent("corso"), ["llm"], False, stats=stats)
+
+    assert stats["omitted"] == 1
+    assert "api_key" not in payload["llm"]["LLMOpenRouterConfig"]
+
+
+def test_dump_configs_warns_about_omitted_secrets(tmp_path):
+    agents = [_agent("corso")]
+    client = FakeClient(
+        agents=agents,
+        factory_lists={
+            ("large_language_model", "corso"): _factory_list(
+                "LLMOpenRouterConfig", {"LLMOpenRouterConfig": {"api_key": "sk-1"}}
+            )
+        },
+    )
+
+    envelope = cli.dump_configs(client, agents, tmp_path, ["llm"], False, [], 1)
+
+    entry = envelope["agents"][0]
+    assert entry["omitted_secrets"] == 1
+    assert entry["warnings"] == ["secrets omitted (1 fields); reload preserves them"]
+    header = (tmp_path / cli._dump_filename("corso")).read_text(encoding="utf-8")
+    assert "# warnings: secrets omitted (1 fields); reload preserves them" in header
+    manifest = yaml.safe_load((tmp_path / "manifest.yml").read_text(encoding="utf-8"))
+    assert manifest["agents"][0]["omitted_secrets"] == 1
+
+
+def test_dump_configs_with_secrets_has_no_warning(tmp_path):
+    agents = [_agent("corso")]
+    client = FakeClient(
+        agents=agents,
+        factory_lists={
+            ("large_language_model", "corso"): _factory_list(
+                "LLMOpenRouterConfig", {"LLMOpenRouterConfig": {"api_key": "sk-1"}}
+            )
+        },
+    )
+
+    envelope = cli.dump_configs(client, agents, tmp_path, ["llm"], True, [], 1)
+
+    entry = envelope["agents"][0]
+    assert entry["omitted_secrets"] == 0
+    assert entry["warnings"] == []
+    header = (tmp_path / cli._dump_filename("corso")).read_text(encoding="utf-8")
+    assert "# secret-policy: included" in header
+    assert "# warnings: none" in header

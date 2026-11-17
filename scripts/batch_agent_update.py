@@ -643,6 +643,18 @@ def _strip_secrets(value: Any) -> Any:
     return value
 
 
+def _count_secret_keys(value: Any) -> int:
+    """Count the keys :func:`_strip_secrets` would omit, at every level."""
+    if isinstance(value, dict):
+        return sum(
+            (1 if _SECRET_KEY.search(str(key)) else 0) + _count_secret_keys(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return sum(_count_secret_keys(item) for item in value)
+    return 0
+
+
 def _effective_categories(categories: list[str], role: str) -> list[str]:
     """Drop system-wide categories for agents that cannot own them."""
     if role == "system":
@@ -655,8 +667,13 @@ def _dump_agent_config(
     agent: AgentOutput,
     categories: list[str],
     include_secrets: bool,
+    stats: dict[str, int] | None = None,
 ) -> dict[str, Any]:
-    """Build the patch-shaped payload for one agent from the live SDK state."""
+    """Build the patch-shaped payload for one agent from the live SDK state.
+
+    When secrets are omitted, ``stats["omitted"]`` (if given) receives the
+    number of dropped keys so the caller can warn about them.
+    """
     role = _agent_role(agent.agent_id)
     payload: dict[str, Any] = {}
     if "metadata" in categories:
@@ -683,6 +700,8 @@ def _dump_agent_config(
             for plugin in collection.installed
         }
     if not include_secrets:
+        if stats is not None:
+            stats["omitted"] = stats.get("omitted", 0) + _count_secret_keys(payload)
         payload = _strip_secrets(payload)
     return payload
 
@@ -865,6 +884,7 @@ def _write_dump_manifest(
                 "selected": entry["selected"],
                 "plugins": entry["plugins"],
                 "warnings": entry["warnings"],
+                "omitted_secrets": entry.get("omitted_secrets", 0),
             }
             for entry in entries
         ],
@@ -911,17 +931,24 @@ def dump_configs(
             "selected": {},
             "plugins": 0,
             "warnings": [],
+            "omitted_secrets": 0,
             "ok": True,
             "reason": None,
         }
         try:
-            payload = _dump_agent_config(client, agent, effective, include_secrets)
+            stats = {"omitted": 0}
+            payload = _dump_agent_config(client, agent, effective, include_secrets, stats=stats)
             entry["selected"] = {
                 category: next(iter(value))
                 for category, value in payload.items()
                 if category in FACTORY_LIST_GETTERS or category in SYSTEM_WIDE_CATEGORIES
             }
             entry["plugins"] = len(payload.get("plugins", {}))
+            entry["omitted_secrets"] = stats["omitted"]
+            if stats["omitted"]:
+                entry["warnings"].append(
+                    f"secrets omitted ({stats['omitted']} fields); reload preserves them"
+                )
             header = _dump_header(
                 agent.agent_id,
                 role,

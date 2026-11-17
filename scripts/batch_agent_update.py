@@ -193,6 +193,7 @@ SYSTEM_WIDE_CATEGORIES = {"embedder", "ingestion"}
 VALID_CATEGORIES = {"metadata", "plugins", *FACTORY_CATEGORIES, *SYSTEM_WIDE_CATEGORIES}
 _OPERATION_ORDER = {"metadata": 0, "llm": 1, "plugin": 2, "settings": 3}
 _PLUGIN_STATES = {"on": True, "true": True, "1": True, "off": False, "false": False, "0": False}
+_YAML_SUFFIXES = {".yml", ".yaml"}
 
 
 def _parse_value(raw: str) -> Any:
@@ -290,21 +291,27 @@ def _parse_leaves(node: Any) -> Any:
     return node
 
 
-def _legacy_comment_hint(text: str) -> str:
-    """Return a migration hint when the file still uses JSONC ``//`` comments."""
+def _comment_syntax_hint(text: str) -> str:
+    """Point at the YAML comment character when a line starts with ``//``."""
     if any(line.lstrip().startswith("//") for line in text.splitlines()):
-        return " (looks like JSONC: use '#' for comments in YAML)"
+        return " (comment syntax in patch files is '#', not '//')"
     return ""
 
 
 def load_patch(path: str) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, bool]]:
     """Load a YAML patch file into per-target patches and ``active_plugins``.
 
-    The file is a ``{category: {name: patch}}`` mapping with one extra top-level
-    key, ``active_plugins``: ``{name: on|off}``. Plain JSON is valid YAML too.
-    Comments start with ``#``; anchors and aliases are allowed because the file
-    is operator-trusted. Returns ``(patches, active_plugins)``.
+    The file must use a ``.yml`` or ``.yaml`` suffix (case-insensitive) and is a
+    ``{category: {name: patch}}`` mapping with one extra top-level key,
+    ``active_plugins``: ``{name: on|off}``. Comments start with ``#``; anchors
+    and aliases are allowed because the file is operator-trusted. Returns
+    ``(patches, active_plugins)``.
     """
+    if Path(path).suffix.lower() not in _YAML_SUFFIXES:
+        raise ValueError(
+            f"invalid --patch {path!r}: patch files must be YAML (.yml or .yaml); "
+            "JSON and JSONC are not supported"
+        )
     try:
         raw = Path(path).read_text(encoding="utf-8")
     except OSError as exc:
@@ -312,7 +319,7 @@ def load_patch(path: str) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[s
     try:
         documents = _yaml_documents(raw)
     except ValueError as exc:
-        raise ValueError(f"invalid --patch {path!r}: {exc}{_legacy_comment_hint(raw)}") from None
+        raise ValueError(f"invalid --patch {path!r}: {exc}{_comment_syntax_hint(raw)}") from None
 
     data = documents[0]
     if not isinstance(data, dict):
@@ -970,7 +977,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--patch",
         metavar="FILE",
-        help="YAML (or plain JSON) file with per-category patches and active_plugins",
+        help="YAML file with per-category patches and active_plugins",
     )
     parser.add_argument(
         "--yes",

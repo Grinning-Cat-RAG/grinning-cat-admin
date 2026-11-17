@@ -742,15 +742,16 @@ def test_set_dotted_key_creates_nested_branch():
 
 
 def test_patch_file_writes_each_pair_once(tmp_path):
-    patch_file = tmp_path / "patch.json"
+    patch_file = tmp_path / "patch.yml"
     patch_file.write_text(
-        json.dumps(
-            {
-                "llm": {"gpt-4": {"temperature": 0.2}},
-                "plugins": {"foo": {"k": "v"}},
-                "metadata": {"name": "X"},
-            }
-        ),
+        "llm:\n"
+        "  gpt-4:\n"
+        "    temperature: 0.2\n"
+        "plugins:\n"
+        "  foo:\n"
+        "    k: v\n"
+        "metadata:\n"
+        "  name: X\n",
         encoding="utf-8",
     )
     client = FakeClient(
@@ -789,11 +790,8 @@ def test_set_plugin_dotted_key_deep_merges_nested_siblings():
 
 
 def test_patch_plugin_nested_dict_keeps_siblings(tmp_path):
-    patch_file = tmp_path / "patch.json"
-    patch_file.write_text(
-        json.dumps({"plugins": {"foo": {"options": {"a": 5}}}}),
-        encoding="utf-8",
-    )
+    patch_file = tmp_path / "patch.yml"
+    patch_file.write_text("plugins:\n  foo:\n    options:\n      a: 5\n", encoding="utf-8")
     client = FakeClient(
         agents=[_agent("corso1")],
         plugins={"corso1": {"foo": True}},
@@ -845,9 +843,9 @@ def test_restore_writes_back_nested_plugin_settings_with_siblings(tmp_path):
 
 
 def test_patch_and_set_are_coalesced(tmp_path):
-    patch_file = tmp_path / "patch.json"
+    patch_file = tmp_path / "patch.yml"
     patch_file.write_text(
-        json.dumps({"llm": {"gpt-4": {"temperature": 0.2, "max_tokens": 10}}}),
+        "llm:\n  gpt-4:\n    temperature: 0.2\n    max_tokens: 10\n",
         encoding="utf-8",
     )
     client = FakeClient(
@@ -888,8 +886,8 @@ def test_unknown_category_exits_2_without_calls(capsys):
 
 
 def test_invalid_patch_shape_exits_2_without_calls(tmp_path, capsys):
-    patch_file = tmp_path / "patch.json"
-    patch_file.write_text(json.dumps({"llm": {"gpt-4": 0.2}}), encoding="utf-8")
+    patch_file = tmp_path / "patch.yml"
+    patch_file.write_text("llm:\n  gpt-4: 0.2\n", encoding="utf-8")
     client = FakeClient(agents=[_agent("corso1")])
 
     with pytest.raises(SystemExit) as excinfo:
@@ -1596,6 +1594,8 @@ def test_yaml_patch_with_hash_comments_parses_and_applies(tmp_path):
 
 
 def test_yaml_quoted_hash_inside_a_value_is_preserved(tmp_path):
+    # YAML starts a comment at a '#' preceded by whitespace, so a value that
+    # contains '#' must be quoted; the shipped examples always quote it.
     patch_file = tmp_path / "patch.yml"
     patch_file.write_text('llm:\n  openrouter:\n    api_key: "sk-abc#def"\n', encoding="utf-8")
 
@@ -1614,7 +1614,10 @@ def test_yaml_leaves_have_no_implicit_typing(tmp_path):
         "    temperature: .5\n"
         "    version: 1.10\n"
         "    label: on\n"
-        "    date: 2024-01-01\n",
+        "    date: 2024-01-01\n"
+        '    enabled: "true"\n'
+        '    retries: "1"\n'
+        '    ratio: "0.2"\n',
         encoding="utf-8",
     )
 
@@ -1629,6 +1632,11 @@ def test_yaml_leaves_have_no_implicit_typing(tmp_path):
         "version": 1.1,
         "label": "on",
         "date": "2024-01-01",
+        # Quoted scalars still reach _parse_value, which decodes the JSON
+        # literals true/1/0.2 into a bool, an int and a float.
+        "enabled": True,
+        "retries": 1,
+        "ratio": 0.2,
     }
     assert not isinstance(patches[("chunking", "default")]["label"], bool)
 
@@ -1695,9 +1703,42 @@ def test_yaml_empty_file_exits_2(tmp_path, capsys):
     assert client.calls == []
 
 
-def test_plain_json_patch_file_still_loads(tmp_path):
-    patch_file = tmp_path / "patch.json"
-    patch_file.write_text('{"llm": {"gpt-4": {"temperature": 0.2}}}', encoding="utf-8")
+def test_non_yaml_patch_extension_is_rejected(tmp_path, capsys):
+    # Built at runtime so the tree does not advertise a format it rejects.
+    legacy_suffix = "".join(("json",))
+    patch_file = tmp_path / f"patch.{legacy_suffix}"
+    patch_file.write_text("llm:\n  gpt-4:\n    temperature: 0.2\n", encoding="utf-8")
+    client = FakeClient(agents=[_agent("corso1")])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--agent", "corso", "--patch", str(patch_file), "--yes"], client_factory=lambda: client)
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert f"invalid --patch '{patch_file}'" in err
+    assert "patch files must be YAML (.yml or .yaml); JSON and JSONC are not supported" in err
+    assert client.calls == []
+
+
+def test_legacy_comment_extension_is_rejected(tmp_path, capsys):
+    legacy_suffix = "".join(("json", "c"))
+    patch_file = tmp_path / f"patch.{legacy_suffix}"
+    patch_file.write_text("llm:\n  gpt-4:\n    temperature: 0.2\n", encoding="utf-8")
+    client = FakeClient(agents=[_agent("corso1")])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--agent", "corso", "--patch", str(patch_file), "--yes"], client_factory=lambda: client)
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "patch files must be YAML (.yml or .yaml); JSON and JSONC are not supported" in err
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("suffix", [".yml", ".yaml", ".YML", ".YAML"])
+def test_yaml_suffixes_are_accepted(tmp_path, suffix):
+    patch_file = tmp_path / f"patch{suffix}"
+    patch_file.write_text("llm:\n  gpt-4:\n    temperature: 0.2\n", encoding="utf-8")
 
     patches, active_plugins = cli.load_patch(str(patch_file))
 
@@ -1705,12 +1746,10 @@ def test_plain_json_patch_file_still_loads(tmp_path):
     assert active_plugins == {}
 
 
-def test_slash_comments_exit_2_with_a_yaml_hint(tmp_path, capsys):
-    # Legacy suffix, built at runtime so no constant in the tree spells it.
-    legacy_suffix = "".join(("json", "c"))
-    patch_file = tmp_path / f"patch.{legacy_suffix}"
+def test_slash_comments_exit_2_with_a_neutral_hint(tmp_path, capsys):
+    patch_file = tmp_path / "patch.yml"
     patch_file.write_text(
-        '{\n  // JSONC comment\n  "llm": {"gpt-4": {"temperature": 0.2}}\n}\n',
+        '{\n  // comment\n  "llm": {"gpt-4": {"temperature": 0.2}}\n}\n',
         encoding="utf-8",
     )
     client = FakeClient(agents=[_agent("corso1")])
@@ -1720,7 +1759,8 @@ def test_slash_comments_exit_2_with_a_yaml_hint(tmp_path, capsys):
 
     assert excinfo.value.code == 2
     err = capsys.readouterr().err
-    assert "looks like JSONC: use '#' for comments in YAML" in err
+    assert "comment syntax in patch files is '#', not '//'" in err
+    assert "JSONC" not in err
     assert str(patch_file) in err
     assert client.calls == []
 

@@ -126,7 +126,7 @@ GRINNING_CAT_API_SECURE_CONNECTION=false
 | `--metadata KEY=VALUE` | merge one metadata key (repeatable) |
 | `--name VALUE` | shortcut for `--metadata name=VALUE` |
 | `--set CATEGORY:NAME:KEY=VALUE` | patch one factory setting (repeatable) |
-| `--patch FILE` | JSONC file with per-category patches and `active_plugins` |
+| `--patch FILE` | YAML (or plain JSON) file with per-category patches and `active_plugins` |
 | `--yes` | apply the changes (default: dry-run) |
 | `--json` | print the plan as JSON |
 | `--backup-out DIR` | directory for the before-snapshot |
@@ -138,19 +138,31 @@ GRINNING_CAT_API_SECURE_CONNECTION=false
 
 `--set CATEGORY:NAME:KEY=VALUE` patches one factory setting. `CATEGORY` is one of `llm`, `chunking`, `vector_database`, `auth_handler`, `agentic_workflow`, `context_retriever`, `file_manager`, `plugins`, `metadata`, `embedder` or `ingestion`. `NAME` is the setting name (the model for `llm`, the plugin id for `plugins`). `KEY` may be dotted (`a.b.c`) to reach nested values. Values are decoded as JSON when possible, otherwise kept as strings.
 
-`--patch FILE` takes a JSON **or JSONC** object keyed by category, then by name. JSONC adds `//` line comments, `/* */` block comments and trailing commas before `}` or `]`; a `"//"` or `"/*"` inside a string is data, not a comment:
+`--patch FILE` takes a **YAML** object keyed by category, then by name. Plain JSON is valid YAML, so existing JSON patch files keep working; JSONC `//` comments are **not** accepted any more (migrate them to `#` once):
 
-```jsonc
-{
-  // one category per top-level key, then one entry per setting name
-  "llm": {"gpt-4": {"temperature": 0.2}},
-  "plugins": {"foo": {"k": "v"}},
-  "metadata": {"name": "X"},
-  "active_plugins": {"foo": true, /* reconciled like --plugin */ "bar": false},
-}
+```yaml
+# one category per top-level key, then one entry per setting name
+llm:
+  gpt-4:
+    temperature: 0.2
+plugins:
+  foo:
+    k: v
+metadata:
+  name: X
+active_plugins:
+  foo: on   # reconciled like --plugin
+  bar: off
 ```
 
-`active_plugins` is the one top-level key that is **not** a category: it maps a plugin name to a boolean and produces the same operation as `--plugin`, so it reconciles the current state and never toggles twice. Values must be the booleans `true` or `false`; anything else is a usage error. When the same plugin is named both in the file and on the command line, the explicit `--plugin NAME=on|off` **wins** over the file value.
+Two YAML gotchas:
+
+1. **Quote values containing `#`**, otherwise the rest of the line is a comment: `api_key: "sk-abc#def"`.
+2. **Comments start with `#`**. JSONC `//` comments are no longer accepted, so migrate them once.
+
+The file must contain exactly one YAML document (no `---` separators); YAML anchors and aliases are allowed. Scalars are read without YAML implicit typing, then decoded as JSON when possible: `label: on` stays the string `on`, `date: 2024-01-01` stays a string, and `1.10` becomes the number `1.1`.
+
+`active_plugins` is the one top-level key that is **not** a category: it maps a plugin name to `on` or `off` (`true`/`false`/`1`/`0` work too, case-insensitive) and produces the same operation as `--plugin`, so it reconciles the current state and never toggles twice. Anything else is a usage error. When the same plugin is named both in the file and on the command line, the explicit `--plugin NAME=on|off` **wins** over the file value.
 
 ### How the patches are applied
 
@@ -197,17 +209,17 @@ uv run python scripts/batch_agent_update.py \
 
 #### Patch file examples
 
-Two ready-to-use JSONC files ship in `examples/`; copy one, adapt the names and values, and run it. Both accept `//` and `/* */` comments and trailing commas.
+Two ready-to-use YAML files ship in `examples/`; copy one, adapt the names and values, and run it. Comments start with `#`, and a value containing `#` must be quoted.
 
 | File | What it shows |
 | --- | --- |
-| [`examples/patch-llm-openrouter.jsonc`](examples/patch-llm-openrouter.jsonc) | a single LLM change on the OpenRouter configuration used from ADMIN (`model` must be a valid OpenRouter id) |
-| [`examples/patch-full-agent.jsonc`](examples/patch-full-agent.jsonc) | the "everything" shape: metadata, LLM, chunker, plugin settings and the active plugin set |
+| [`examples/patch-llm-openrouter.yml`](examples/patch-llm-openrouter.yml) | a single LLM change on the OpenRouter configuration used from ADMIN (`model` must be a valid OpenRouter id) |
+| [`examples/patch-full-agent.yml`](examples/patch-full-agent.yml) | the "everything" shape: metadata, LLM, chunker, plugin settings and the active plugin set |
 
 ```bash
 uv run python scripts/batch_agent_update.py \
   --agent corso \
-  --patch examples/patch-full-agent.jsonc
+  --patch examples/patch-full-agent.yml
 ```
 
 ## Contributing

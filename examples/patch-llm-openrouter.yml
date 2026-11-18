@@ -11,7 +11,7 @@
 # [...]", which lists every valid name.
 #
 # 1. Dry-run first: without --yes the script prints the plan and exits 2.
-#      uv run python scripts/batch_agent_update.py \
+#      docker exec <container> python /app/cat/plugins/cat_batch/scripts/batch_agent_update.py \
 #        --agent corso --patch examples/patch-llm-openrouter.yml
 # 2. Read the plan, then add --yes to write.
 #

@@ -5,7 +5,7 @@
 # keys you list change: the script reads the current settings, merges this patch
 # and writes the result back, so everything you omit survives.
 #
-#   uv run python scripts/batch_agent_update.py \
+#   docker exec <container> python /app/cat/plugins/cat_batch/scripts/batch_agent_update.py \
 #     --agent corso --patch examples/patch-full-agent.yml
 #
 # Add --yes only when the plan looks right.

@@ -97,6 +97,60 @@ The admin interface supports two ways of authenticating against Grinning Cat Cor
   the whole UI is available to anyone who can reach it. Leave it unset unless
   the UI is only exposed to trusted users.
 
+## Plugin-exported UI
+
+ADMIN renders UI that plugins export through a `ui.json` manifest. The contract
+(manifest shape, destinations, settings, limits) is owned by the core docs:
+[`docs/plugins/plugin-ui/`](https://github.com/Grinning-Cat-RAG/grinning-cat-core/tree/main/docs/plugins/plugin-ui).
+This section documents only the ADMIN side.
+
+### Environment
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `GRINNING_CAT_PLUGIN_UI_DIRS` | (empty) | `os.pathsep`-separated plugin directories to scan for `ui.json`. Empty disables plugin UI. |
+| `GRINNING_CAT_PLUGIN_UI_REFRESH_SECONDS` | `60` | Discovery cache TTL. `0` disables the cache (useful in dev/QA). |
+| `GRINNING_CAT_PLUGIN_UI_REQUIRE_INSTALLED` | `true` | When true, a plugin must be active in CAT to be discovered. Set `false` only in dev. |
+
+### Read-only mount
+
+ADMIN only reads the plugin directories: it never writes to them. Mount the
+shared plugin folder read-only, for example in compose:
+
+```yaml
+volumes:
+  - ./data/grinning/plugins:/opt/cat-plugins:ro
+environment:
+  GRINNING_CAT_PLUGIN_UI_DIRS: /opt/cat-plugins
+```
+
+A plugin installed through upload or the registry lands in the core's plugin
+folder, which is the same directory mounted here, so it becomes visible to ADMIN
+without a rebuild.
+
+### Destination gating
+
+ADMIN renders two of the four destinations:
+
+- `admin_system` only when the selected agent is the `system` agent, the plugin
+  is active for `system`, and the user passes `has_access(permission)`.
+- `admin_agent` only when the selected agent is not `system`, the plugin is
+  active for that agent, and the user passes `has_access(permission)`.
+
+The `instructor` and `chatbot` destinations belong to RITA and are not rendered
+by ADMIN.
+
+### Trust model
+
+Plugin code is trusted: an ADMIN page runs in the same trust domain as the
+plugin's Python inside CAT. Only mount plugin directories you control.
+
+### Test
+
+```bash
+pytest tests/plugins_ui
+```
+
 ## Batch agent updates
 
 `scripts/batch_agent_update.py` updates many agents in one run. It selects agents by a case-insensitive substring of `agent_id` (or every non-system agent with `--all`), then applies LLM, plugin, metadata and factory-setting patches through the official SDK and REST API. Nothing is written unless you pass `--yes`: the default is a dry run that prints the plan and exits with code 2.

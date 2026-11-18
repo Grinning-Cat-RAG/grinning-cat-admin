@@ -96,4 +96,7 @@ def test_dispatch_by_page_key_after_another_agent(
 
     registry.entries("agent-x")
 
-    assert registry.dispatch(page_key, SimpleNamespace(plugin_id="cat_batch")) == "cat_batch"
+    assert (
+        registry.dispatch(page_key, SimpleNamespace(plugin_id="cat_batch"), "system")
+        == "cat_batch"
+    )

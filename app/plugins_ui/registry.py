@@ -91,8 +91,8 @@ class PluginPageRegistry:
         return list(self._dirs) if self._dirs is not None else _dirs_from_env()
 
     def _resolve_client(self) -> Any | None:
-        # ``discover`` builds its own client only on a cache miss, so a cache
-        # hit does not pay for a client construction on every rerun.
+        # The default path builds no client on a cache hit: ``discover`` builds
+        # one only on a miss. An injected factory is always called.
         return self._client_factory() if self._client_factory is not None else None
 
     def entries(self, agent_id: str) -> list[AdminEntry]:
@@ -119,29 +119,23 @@ class PluginPageRegistry:
             self._index[agent_id] = {entry.page_key: entry for entry in entries}
         return list(entries)
 
-    def get(self, page_key: str, agent_id: str | None = None) -> AdminEntry | None:
-        """Return the entry for ``page_key``.
+    def get(self, page_key: str, agent_id: str) -> AdminEntry | None:
+        """Return the entry for ``page_key`` as visible to ``agent_id``.
 
-        With ``agent_id`` the lookup is scoped to that agent; without it every
-        per-agent index is searched. The same plugin page resolves to the same
-        module path for every agent, so the first match is equivalent.
+        ``agent_id`` is required: a page that is not visible to that agent must
+        never be resolved, even if another agent's index holds it.
         """
         with self._lock:
-            if agent_id is not None:
-                return self._index.get(agent_id, {}).get(page_key)
-            for index in self._index.values():
-                entry = index.get(page_key)
-                if entry is not None:
-                    return entry
-            return None
+            return self._index.get(agent_id, {}).get(page_key)
 
-    def __contains__(self, page_key: object) -> bool:
-        return isinstance(page_key, str) and self.get(page_key) is not None
+    def load(self, entry: AdminEntry | str, agent_id: str | None = None) -> ModuleType:
+        """Import the page module for ``entry``, caching by path and digest.
 
-    def load(self, entry: AdminEntry | str) -> ModuleType:
-        """Import the page module for ``entry``, caching by path and digest."""
+        A page key is resolved only within ``agent_id``; without it the key is
+        treated as unknown.
+        """
         if isinstance(entry, str):
-            resolved = self.get(entry)
+            resolved = self.get(entry, agent_id) if agent_id is not None else None
             if resolved is None:
                 raise PluginLoadError(f"unknown plugin page: {entry}")
             entry = resolved
@@ -188,15 +182,18 @@ class PluginPageRegistry:
             self._modules[cache_key] = module
         return module
 
-    def dispatch(self, entry: AdminEntry | str, ctx: Any) -> Any:
+    def dispatch(
+        self, entry: AdminEntry | str, ctx: Any, agent_id: str | None = None
+    ) -> Any:
         """Import the page and call its ``render(ctx)``.
 
         ``entry`` may be the already-resolved :class:`AdminEntry`: the app
         passes it so a concurrent session on another agent cannot invalidate
-        the lookup between the sidebar and the render.
+        the lookup between the sidebar and the render. A page key is resolved
+        only within ``agent_id``.
         """
         if isinstance(entry, str):
-            resolved = self.get(entry)
+            resolved = self.get(entry, agent_id) if agent_id is not None else None
             if resolved is None:
                 raise PluginLoadError(f"unknown plugin page: {entry}")
             entry = resolved
@@ -244,16 +241,16 @@ def entries(agent_id: str) -> list[AdminEntry]:
     return get_registry().entries(agent_id)
 
 
-def get(page_key: str) -> AdminEntry | None:
-    return get_registry().get(page_key)
+def get(page_key: str, agent_id: str) -> AdminEntry | None:
+    return get_registry().get(page_key, agent_id)
 
 
-def load(entry: AdminEntry | str) -> ModuleType:
-    return get_registry().load(entry)
+def load(entry: AdminEntry | str, agent_id: str | None = None) -> ModuleType:
+    return get_registry().load(entry, agent_id)
 
 
-def dispatch(entry: AdminEntry | str, ctx: Any) -> Any:
-    return get_registry().dispatch(entry, ctx)
+def dispatch(entry: AdminEntry | str, ctx: Any, agent_id: str | None = None) -> Any:
+    return get_registry().dispatch(entry, ctx, agent_id)
 
 
 def invalidate(agent_id: str | None = None) -> None:

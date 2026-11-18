@@ -36,8 +36,7 @@ def test_registry_entries_and_get(plugin_root: Path, fake_client) -> None:
     assert entry.component_id == "batch-update"
     assert entry.module_path.name == "batch_update.py"
     assert entry.plugin_dir == plugin_root
-    assert registry.get(entry.page_key) is entry
-    assert entry.page_key in registry
+    assert registry.get(entry.page_key, "system") is entry
 
 
 def test_registry_entries_switch_agent(plugin_root: Path, fake_client) -> None:
@@ -48,8 +47,8 @@ def test_registry_entries_switch_agent(plugin_root: Path, fake_client) -> None:
 
     assert system_entries[0].page_key != agent_entries[0].page_key
     # both per-agent indexes coexist: fetching one agent must not clear the other
-    assert registry.get(system_entries[0].page_key) is system_entries[0]
-    assert registry.get(agent_entries[0].page_key) is agent_entries[0]
+    assert registry.get(system_entries[0].page_key, "system") is system_entries[0]
+    assert registry.get(agent_entries[0].page_key, "cat_batch") is agent_entries[0]
 
 
 def test_registry_load_and_dispatch(plugin_root: Path, fake_client) -> None:
@@ -59,13 +58,13 @@ def test_registry_load_and_dispatch(plugin_root: Path, fake_client) -> None:
         encoding="utf-8",
     )
     registry = _registry(plugin_root, fake_client)
-    page_key = registry.entries("system")[0].page_key
+    entry = registry.entries("system")[0]
 
-    module = registry.load(page_key)
+    module = registry.load(entry)
     ctx = SimpleNamespace(plugin_id="cat_batch", component_id="batch-update")
 
     assert callable(module.render)
-    assert registry.dispatch(page_key, ctx) == {
+    assert registry.dispatch(entry, ctx) == {
         "plugin": "cat_batch",
         "component": "batch-update",
     }
@@ -73,9 +72,9 @@ def test_registry_load_and_dispatch(plugin_root: Path, fake_client) -> None:
 
 def test_registry_load_caches_module(plugin_root: Path, fake_client) -> None:
     registry = _registry(plugin_root, fake_client)
-    page_key = registry.entries("system")[0].page_key
+    entry = registry.entries("system")[0]
 
-    assert registry.load(page_key) is registry.load(page_key)
+    assert registry.load(entry) is registry.load(entry)
 
 
 def test_registry_dispatch_import_failure(plugin_root: Path, fake_client) -> None:
@@ -83,10 +82,10 @@ def test_registry_dispatch_import_failure(plugin_root: Path, fake_client) -> Non
         "raise RuntimeError('boom')\n", encoding="utf-8"
     )
     registry = _registry(plugin_root, fake_client)
-    page_key = registry.entries("system")[0].page_key
+    entry = registry.entries("system")[0]
 
     with pytest.raises(PluginLoadError, match="cannot import"):
-        registry.dispatch(page_key, object())
+        registry.dispatch(entry, object())
 
 
 def test_registry_dispatch_render_failure(plugin_root: Path, fake_client) -> None:
@@ -94,10 +93,10 @@ def test_registry_dispatch_render_failure(plugin_root: Path, fake_client) -> Non
         "def render(ctx):\n    raise ValueError('nope')\n", encoding="utf-8"
     )
     registry = _registry(plugin_root, fake_client)
-    page_key = registry.entries("system")[0].page_key
+    entry = registry.entries("system")[0]
 
     with pytest.raises(PluginLoadError, match="failed to render"):
-        registry.dispatch(page_key, object())
+        registry.dispatch(entry, object())
 
 
 def test_registry_dispatch_missing_render(plugin_root: Path, fake_client) -> None:
@@ -105,17 +104,16 @@ def test_registry_dispatch_missing_render(plugin_root: Path, fake_client) -> Non
         "VALUE = 1\n", encoding="utf-8"
     )
     registry = _registry(plugin_root, fake_client)
-    page_key = registry.entries("system")[0].page_key
+    entry = registry.entries("system")[0]
 
     with pytest.raises(PluginLoadError, match="no callable render"):
-        registry.dispatch(page_key, object())
+        registry.dispatch(entry, object())
 
 
 def test_registry_unknown_page_key(plugin_root: Path, fake_client) -> None:
     registry = _registry(plugin_root, fake_client)
 
-    assert registry.get("plugin:nope:nope") is None
-    assert "plugin:nope:nope" not in registry
+    assert registry.get("plugin:nope:nope", "system") is None
     with pytest.raises(PluginLoadError, match="unknown plugin page"):
         registry.load("plugin:nope:nope")
     with pytest.raises(PluginLoadError, match="unknown plugin page"):
@@ -149,10 +147,10 @@ def test_registry_rejects_module_grown_after_discovery(
     plugin_root: Path, fake_client
 ) -> None:
     registry = _registry(plugin_root, fake_client)
-    page_key = registry.entries("system")[0].page_key
+    entry = registry.entries("system")[0]
     (plugin_root / "admin/pages/batch_update.py").write_text(
         "#" * (MAX_ADMIN_MODULE_BYTES + 1), encoding="utf-8"
     )
 
     with pytest.raises(PluginLoadError, match="limit is"):
-        registry.load(page_key)
+        registry.load(entry)

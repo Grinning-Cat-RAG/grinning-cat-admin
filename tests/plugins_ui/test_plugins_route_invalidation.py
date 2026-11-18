@@ -11,7 +11,6 @@ import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 import streamlit as st
 
 from app.plugins_ui import registry as plugin_registry

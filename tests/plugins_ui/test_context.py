@@ -39,7 +39,7 @@ def test_build_context_fields(plugin_root: Path, fake_client) -> None:
     assert ctx.agent_id == "system"
     assert ctx.me is me
     assert ctx.user == {"id": 7}
-    assert ctx.has_access is app.utils.has_access
+    assert callable(ctx.has_access)
     assert ctx.render_json_form is app.utils.render_json_form
     assert callable(ctx.log)
     ctx.log("hello")
@@ -72,3 +72,25 @@ def test_context_is_frozen(plugin_root: Path, fake_client) -> None:
 
     with pytest.raises(FrozenInstanceError):
         ctx.agent_id = "other"
+
+
+def test_context_has_access_is_bound_to_the_logged_in_user(
+    plugin_root: Path, fake_client, monkeypatch
+) -> None:
+    """A page calls ``ctx.has_access(resource, permission)``: the host helper
+    takes the user positionally, so the context must bind it."""
+    import app.utils
+
+    seen = []
+
+    def fake_has_access(resource, required_role, cookie_me, only_admin=False):
+        seen.append((resource, required_role, cookie_me, only_admin))
+        return True
+
+    monkeypatch.setattr(app.utils, "has_access", fake_has_access)
+    me = {"user": {"id": 7}, "agents": []}
+
+    ctx = build_context(_entry(plugin_root), "system", me, client=fake_client)
+
+    assert ctx.has_access("SYSTEM", "READ") is True
+    assert seen == [("SYSTEM", "READ", me, False)]

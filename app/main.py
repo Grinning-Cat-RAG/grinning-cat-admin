@@ -182,8 +182,12 @@ def _build_agents_toggle_select(k: str, cookie_me: Dict):
     if menu_options[choice] is None:
         return
 
+    previous_agent = st.session_state.get("agent_id")
     _reset_agent_scoped_state()
     st.session_state["agent_id"] = choice
+    # The plugin pages are cached per agent: drop the previous agent's entries
+    # so the new agent's destinations are discovered from scratch.
+    _invalidate_plugin_ui(previous_agent)
     st.rerun()
 
 
@@ -288,6 +292,70 @@ def _render_management_banner():
     )
 
 
+def _plugin_ui_registry():
+    """Import the plugin-page registry lazily.
+
+    Importing it at module level would be harmless, but keeping it here makes
+    it explicit that no plugin is discovered (and no CAT call is made) until a
+    page is actually needed.
+    """
+    from app.plugins_ui import registry
+
+    return registry
+
+
+def _invalidate_plugin_ui(agent_id: str | None) -> None:
+    """Drop the cached plugin pages for ``agent_id`` (never raises)."""
+    if not agent_id:
+        return
+    try:
+        _plugin_ui_registry().invalidate(agent_id)
+    except Exception as error:  # noqa: BLE001 - a cache miss must not break the app
+        print(f"[plugin-ui] cannot invalidate the plugin pages: {error}")
+
+
+def _plugin_ui_menu_group(
+    cookie_me: dict[str, object] | None,
+) -> dict[str, dict[str, str | bool]]:
+    """Sidebar entries for the plugin pages visible to the current agent.
+
+    The destination gate (system vs real agent, plugin active) is already
+    applied by discovery; here only the component's own permission is checked.
+    A discovery failure yields an empty group, so the app keeps working.
+    """
+    agent_id = st.session_state.get("agent_id")
+    if not agent_id or not cookie_me:
+        return {}
+
+    try:
+        entries = _plugin_ui_registry().entries(agent_id)
+    except Exception as error:  # noqa: BLE001 - discovery must never break the app
+        print(f"[plugin-ui] cannot list the plugin pages: {error}")
+        return {}
+
+    failed = st.session_state.get("_plugin_ui_failed") or set()
+    group: dict[str, dict[str, str | bool]] = {}
+    for entry in entries:
+        if entry.page_key in failed:
+            continue
+        permission = entry.permission
+        allowed = (
+            has_access(permission.resource, permission.permission, cookie_me)
+            if permission is not None
+            else True
+        )
+        label = entry.label
+        if label in group:
+            # two plugins may ship the same title: keep both buttons distinct
+            label = f"{label} ({entry.plugin_id})"
+        group[label] = {
+            "page": entry.page_key,
+            "label": entry.label,
+            "allowed": allowed,
+        }
+    return group
+
+
 def _render_sidebar_navigation(cookie_me: Dict):
     """Render the sidebar navigation menu"""
     st.session_state["selected_page"] = st.session_state.get("selected_page")
@@ -378,6 +446,24 @@ def _render_sidebar_navigation(cookie_me: Dict):
             },
         },
     }
+
+    plugin_menu = _plugin_ui_menu_group(cookie_me)
+    if plugin_menu:
+        system_menu = navigation_options.pop("menu_system")
+        navigation_options["menu_plugins"] = plugin_menu
+        navigation_options["menu_system"] = system_menu
+
+    # A plugin page can disappear (plugin deactivated, agent changed): do not
+    # leave the session on a page the sidebar no longer offers.
+    selected_page = st.session_state.get("selected_page")
+    if isinstance(selected_page, str) and selected_page.startswith("plugin:"):
+        visible_pages = {
+            item["page"]
+            for menu_items in navigation_options.values()
+            for item in menu_items.values()
+        }
+        if selected_page not in visible_pages:
+            st.session_state["selected_page"] = None
 
     if is_management_active(st.session_state.get("management")):
         navigation_options = {"menu_system": navigation_options["menu_system"]}
@@ -536,6 +622,49 @@ async def _main():
     login_page()
 
 
+def _render_plugin_page(page_key: str, cookie_me: dict[str, object] | None) -> bool:
+    """Render a plugin page, isolating every failure from the rest of the app.
+
+    Returns True when the page was handled (rendered or reported as failed) and
+    False when it is no longer available, so the caller can fall back to the
+    welcome screen.
+    """
+    failed = st.session_state.setdefault("_plugin_ui_failed", set())
+    if page_key in failed:
+        return False
+
+    agent_id = st.session_state.get("agent_id")
+    if not agent_id or not cookie_me:
+        return False
+
+    try:
+        registry = _plugin_ui_registry()
+        # Streamlit reruns: the agent may have changed since the sidebar drew
+        # the entry, so re-check it against the current agent.
+        entry = next(
+            (item for item in registry.entries(agent_id) if item.page_key == page_key),
+            None,
+        )
+        if entry is None:
+            return False
+        if entry.permission is not None and not has_access(
+            entry.permission.resource, entry.permission.permission, cookie_me
+        ):
+            return False
+
+        from app.plugins_ui.context import build_context
+
+        registry.dispatch(page_key, build_context(entry, agent_id, cookie_me))
+        return True
+    except Exception as error:  # noqa: BLE001 - a broken plugin must not crash the app
+        failed.add(page_key)
+        st.session_state["_plugin_ui_failed"] = failed
+        plugin_id = page_key.split(":")[1] if page_key.count(":") >= 2 else page_key
+        print(f"[plugin-ui] page '{page_key}' failed: {error}")
+        st.error(f"Plugin '{plugin_id}' page failed to load: {error}")
+        return True
+
+
 async def _render_page(cookie_me: Dict):
     """Dispatch to the correct page based on selected_page."""
     current_page = st.session_state["selected_page"]
@@ -598,6 +727,12 @@ async def _render_page(cookie_me: Dict):
     if current_page == "system":
         utilities_management(cookie_me)
         return
+
+    if isinstance(current_page, str) and current_page.startswith("plugin:"):
+        if _render_plugin_page(current_page, cookie_me):
+            return
+        # the page vanished or already failed: fall back to the welcome screen
+        st.session_state["selected_page"] = None
 
     welcome(cookie_me)
 

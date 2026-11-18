@@ -8,6 +8,7 @@ so a page cannot replace the injected dependencies.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 
@@ -57,6 +58,7 @@ def build_context(
         client = GrinningCatClient(build_client_configuration())
 
     user = me.get("user") if isinstance(me, dict) else None
+    cookie_me = me if isinstance(me, dict) else {}
     return PluginPageContext(
         plugin_id=entry.plugin_id,
         component_id=entry.component_id,
@@ -65,7 +67,9 @@ def build_context(
         agent_id=agent_id,
         me=me,
         user=user,
-        has_access=has_access,
+        # The host helper takes the logged-in user positionally; bind it here so
+        # a page can call ``ctx.has_access(resource, permission)``.
+        has_access=partial(has_access, cookie_me=cookie_me),
         render_json_form=render_json_form,
         log=log or _default_log(entry.plugin_id),
     )

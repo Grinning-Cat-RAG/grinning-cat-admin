@@ -22,6 +22,16 @@ from app.utils import (
 ITEMS_PER_PAGE = 20
 
 
+def _invalidate_plugin_ui(agent_id: str) -> None:
+    """Drop the cached plugin pages for ``agent_id`` (never raises)."""
+    try:
+        from app.plugins_ui import registry
+
+        registry.invalidate(agent_id)
+    except Exception as error:  # noqa: BLE001 - a cache miss must not break the page
+        print(f"[plugin-ui] cannot invalidate the plugin pages: {error}")
+
+
 def _image_to_base64(img_path: str) -> str:
     """Convert an image file to a base64 string."""
     if not os.path.exists(img_path) or not os.path.isfile(img_path):
@@ -414,6 +424,9 @@ def manage_plugin(plugin_id: str, untoggling_plugins_ids: List[str]):
                         spinner_container = show_overlay_spinner("Saving plugin settings...")
                         try:
                             client.plugins.put_plugin_settings(plugin_id, agent_id, edited_settings)
+                            # A settings toggle (e.g. a plugin UI switch) must be
+                            # visible immediately in ADMIN, not after the TTL.
+                            _invalidate_plugin_ui(agent_id)
                             st.session_state["toast"] = {
                                 "message": f"Plugin {plugin_id} settings updated successfully!", "icon": "✅"
                             }

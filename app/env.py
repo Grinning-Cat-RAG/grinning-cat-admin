@@ -11,6 +11,10 @@ def get_supported_env_variables():
         "GRINNING_CAT_CHECK_INTERVAL": "20",
         "GRINNING_CAT_JWT_EXPIRE_MINUTES": str(60 * 24),  # JWT expires after 1 day
         "GRINNING_CAT_ENVIRONMENT": "prod",
+        # Plugin-exported UI: os.pathsep-separated plugin directories and the
+        # discovery cache TTL (0 disables the cache, useful in dev/QA).
+        "GRINNING_CAT_PLUGIN_UI_DIRS": "",
+        "GRINNING_CAT_PLUGIN_UI_REFRESH_SECONDS": "60",
     }
 
 

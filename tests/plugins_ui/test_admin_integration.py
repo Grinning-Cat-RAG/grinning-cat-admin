@@ -162,14 +162,15 @@ def test_render_page_dispatches_to_the_plugin(
     calls = []
     monkeypatch.setattr(plugin_registry, "entries", lambda agent_id: [entry])
     monkeypatch.setattr(
-        plugin_registry, "dispatch", lambda page_key, ctx: calls.append((page_key, ctx))
+        plugin_registry, "dispatch", lambda resolved, ctx: calls.append((resolved, ctx))
     )
     monkeypatch.setattr(main, "has_access", lambda *a, **k: True)
     monkeypatch.setattr(main, "welcome", lambda *a, **k: pytest.fail("welcome must not run"))
 
     asyncio.run(main._render_page(ME))
 
-    assert calls[0][0] == PAGE_KEY
+    # the already-resolved entry is passed, not the page key
+    assert calls[0][0] is entry
     ctx = calls[0][1]
     assert ctx.agent_id == "system"
     assert ctx.me is ME
@@ -215,8 +216,8 @@ def test_plugin_render_failure_is_isolated_and_skipped(
     errors: list[str] = []
     calls: list[str] = []
 
-    def boom(page_key, ctx):
-        calls.append(page_key)
+    def boom(resolved, ctx):
+        calls.append(resolved)
         raise RuntimeError("kaboom")
 
     monkeypatch.setattr(plugin_registry, "entries", lambda agent_id: [entry])
@@ -226,7 +227,7 @@ def test_plugin_render_failure_is_isolated_and_skipped(
 
     asyncio.run(main._render_page(ME))
 
-    assert calls == [PAGE_KEY]
+    assert calls == [entry]
     assert len(errors) == 1
     assert "cat_batch" in errors[0]
     assert PAGE_KEY in session_state["_plugin_ui_failed"]
@@ -235,7 +236,7 @@ def test_plugin_render_failure_is_isolated_and_skipped(
     monkeypatch.setattr(main, "welcome", lambda *a, **k: None)
     asyncio.run(main._render_page(ME))
 
-    assert calls == [PAGE_KEY]
+    assert calls == [entry]
     assert session_state["selected_page"] is None
 
 

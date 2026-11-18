@@ -22,8 +22,8 @@ from app.utils import (
 ITEMS_PER_PAGE = 20
 
 
-def _invalidate_plugin_ui(agent_id: str) -> None:
-    """Drop the cached plugin pages for ``agent_id`` (never raises)."""
+def _invalidate_plugin_ui(agent_id: str | None = None) -> None:
+    """Drop the cached plugin pages for ``agent_id`` (``None`` = every agent)."""
     try:
         from app.plugins_ui import registry
 
@@ -159,6 +159,7 @@ def _render_installed_plugin_admins(
                     spinner_container = show_overlay_spinner("Toggling plugin...")
                     try:
                         client.admins.put_toggle_plugin(p.id)
+                        _invalidate_plugin_ui()
                         st.toast(f"Plugin {p.id} toggled successfully!", icon="✅")
                         time.sleep(1)
                     except Exception as e:
@@ -224,6 +225,7 @@ def _list_plugins_admins(client: GrinningCatClient, search_query: str, cookie_me
                     spinner_container = show_overlay_spinner("Uninstalling plugin...")
                     try:
                         client.admins.delete_plugin(plugin)
+                        _invalidate_plugin_ui()
                         st.toast(f"Plugin {plugin} uninstalled successfully!", icon="✅")
                         st.session_state.pop("plugin_to_uninstall", None)
                     except Exception as e:
@@ -461,6 +463,7 @@ You have to activate the plugin before managing its settings.""")
             spinner_container = show_overlay_spinner(f"{'Untoggling' if is_plugin_active else 'Toggling'} plugin...")
             try:
                 client.plugins.put_toggle_plugin(plugin_id, agent_id)
+                _invalidate_plugin_ui(agent_id)
                 st.session_state["toast"] = {
                     "message": f"Plugin {plugin_id} {'untoggled' if is_plugin_active else 'toggled'} successfully!",
                     "icon": "✅",

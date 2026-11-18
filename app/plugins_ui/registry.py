@@ -65,20 +65,13 @@ def _dirs_from_env() -> list[Path]:
     return [Path(part) for part in raw.split(os.pathsep) if part.strip()]
 
 
-def _default_client() -> Any:
-    from grinning_cat_python_sdk import GrinningCatClient
-
-    from app.utils import build_client_configuration
-
-    return GrinningCatClient(build_client_configuration())
-
-
 class PluginPageRegistry:
     """Lazy, per-agent registry of plugin pages.
 
-    ``entries(agent_id)`` runs discovery on first use and caches the result for
-    the current agent; ``invalidate`` drops both the registry and the discovery
-    caches so a settings change is visible immediately.
+    ``entries(agent_id)`` runs discovery, whose TTL cache honours
+    ``GRINNING_CAT_PLUGIN_UI_REFRESH_SECONDS`` (``0`` disables it), and keeps a
+    per-agent index of the resolved entries. ``invalidate`` drops the index and
+    the discovery cache so a settings change is visible immediately.
     """
 
     def __init__(
@@ -90,31 +83,26 @@ class PluginPageRegistry:
         self._dirs = [Path(directory) for directory in dirs] if dirs is not None else None
         self._client_factory = client_factory
         self._require_installed = require_installed
-        self._entries: dict[str, list[AdminEntry]] = {}
-        self._index: dict[str, AdminEntry] = {}
-        self._current_agent: str | None = None
+        self._index: dict[str, dict[str, AdminEntry]] = {}
         self._modules: dict[tuple[str, str], ModuleType] = {}
         self._lock = threading.Lock()
 
     def _resolve_dirs(self) -> list[Path]:
         return list(self._dirs) if self._dirs is not None else _dirs_from_env()
 
-    def _resolve_client(self) -> Any:
-        if self._client_factory is not None:
-            return self._client_factory()
-        return _default_client()
+    def _resolve_client(self) -> Any | None:
+        # ``discover`` builds its own client only on a cache miss, so a cache
+        # hit does not pay for a client construction on every rerun.
+        return self._client_factory() if self._client_factory is not None else None
 
     def entries(self, agent_id: str) -> list[AdminEntry]:
-        """Return the entries visible for ``agent_id`` (never raises)."""
-        with self._lock:
-            if self._current_agent != agent_id:
-                self._entries.clear()
-                self._index.clear()
-                self._current_agent = agent_id
-            cached = self._entries.get(agent_id)
-        if cached is not None:
-            return list(cached)
+        """Return the entries visible for ``agent_id`` (never raises).
 
+        The TTL lives in :func:`discover`, so a plugin removed from disk
+        disappears after ``GRINNING_CAT_PLUGIN_UI_REFRESH_SECONDS``. The
+        per-agent index is rebuilt from the (possibly cached) components, and
+        fetching one agent's entries never clears another agent's index.
+        """
         try:
             components = discover(
                 self._resolve_dirs(),
@@ -128,23 +116,36 @@ class PluginPageRegistry:
 
         entries = [_entry_from(component) for component in components]
         with self._lock:
-            self._entries[agent_id] = entries
-            self._index = {entry.page_key: entry for entry in entries}
+            self._index[agent_id] = {entry.page_key: entry for entry in entries}
         return list(entries)
 
-    def get(self, page_key: str) -> AdminEntry | None:
-        """Return the entry for ``page_key`` from the current agent's index."""
+    def get(self, page_key: str, agent_id: str | None = None) -> AdminEntry | None:
+        """Return the entry for ``page_key``.
+
+        With ``agent_id`` the lookup is scoped to that agent; without it every
+        per-agent index is searched. The same plugin page resolves to the same
+        module path for every agent, so the first match is equivalent.
+        """
         with self._lock:
-            return self._index.get(page_key)
+            if agent_id is not None:
+                return self._index.get(agent_id, {}).get(page_key)
+            for index in self._index.values():
+                entry = index.get(page_key)
+                if entry is not None:
+                    return entry
+            return None
 
     def __contains__(self, page_key: object) -> bool:
         return isinstance(page_key, str) and self.get(page_key) is not None
 
-    def load(self, page_key: str) -> ModuleType:
-        """Import the page module for ``page_key``, caching by path and digest."""
-        entry = self.get(page_key)
-        if entry is None:
-            raise PluginLoadError(f"unknown plugin page: {page_key}")
+    def load(self, entry: AdminEntry | str) -> ModuleType:
+        """Import the page module for ``entry``, caching by path and digest."""
+        if isinstance(entry, str):
+            resolved = self.get(entry)
+            if resolved is None:
+                raise PluginLoadError(f"unknown plugin page: {entry}")
+            entry = resolved
+        page_key = entry.page_key
 
         path = entry.module_path
         try:
@@ -187,9 +188,20 @@ class PluginPageRegistry:
             self._modules[cache_key] = module
         return module
 
-    def dispatch(self, page_key: str, ctx: Any) -> Any:
-        """Import the page and call its ``render(ctx)``."""
-        module = self.load(page_key)
+    def dispatch(self, entry: AdminEntry | str, ctx: Any) -> Any:
+        """Import the page and call its ``render(ctx)``.
+
+        ``entry`` may be the already-resolved :class:`AdminEntry`: the app
+        passes it so a concurrent session on another agent cannot invalidate
+        the lookup between the sidebar and the render.
+        """
+        if isinstance(entry, str):
+            resolved = self.get(entry)
+            if resolved is None:
+                raise PluginLoadError(f"unknown plugin page: {entry}")
+            entry = resolved
+        page_key = entry.page_key
+        module = self.load(entry)
         render = getattr(module, "render", None)
         if not callable(render):
             raise PluginLoadError(f"plugin page '{page_key}' has no callable render(ctx)")
@@ -202,14 +214,9 @@ class PluginPageRegistry:
         """Drop cached entries (and the discovery cache) for one or all agents."""
         with self._lock:
             if agent_id is None:
-                self._entries.clear()
                 self._index.clear()
-                self._current_agent = None
             else:
-                self._entries.pop(agent_id, None)
-                if self._current_agent == agent_id:
-                    self._index.clear()
-                    self._current_agent = None
+                self._index.pop(agent_id, None)
         clear_cache()
 
 
@@ -241,12 +248,12 @@ def get(page_key: str) -> AdminEntry | None:
     return get_registry().get(page_key)
 
 
-def load(page_key: str) -> ModuleType:
-    return get_registry().load(page_key)
+def load(entry: AdminEntry | str) -> ModuleType:
+    return get_registry().load(entry)
 
 
-def dispatch(page_key: str, ctx: Any) -> Any:
-    return get_registry().dispatch(page_key, ctx)
+def dispatch(entry: AdminEntry | str, ctx: Any) -> Any:
+    return get_registry().dispatch(entry, ctx)
 
 
 def invalidate(agent_id: str | None = None) -> None:

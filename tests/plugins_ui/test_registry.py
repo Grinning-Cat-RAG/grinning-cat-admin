@@ -47,7 +47,8 @@ def test_registry_entries_switch_agent(plugin_root: Path, fake_client) -> None:
     agent_entries = registry.entries("cat_batch")
 
     assert system_entries[0].page_key != agent_entries[0].page_key
-    assert registry.get(system_entries[0].page_key) is None
+    # both per-agent indexes coexist: fetching one agent must not clear the other
+    assert registry.get(system_entries[0].page_key) is system_entries[0]
     assert registry.get(agent_entries[0].page_key) is agent_entries[0]
 
 

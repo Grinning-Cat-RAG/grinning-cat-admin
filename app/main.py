@@ -654,7 +654,9 @@ def _render_plugin_page(page_key: str, cookie_me: dict[str, object] | None) -> b
 
         from app.plugins_ui.context import build_context
 
-        registry.dispatch(page_key, build_context(entry, agent_id, cookie_me))
+        # pass the resolved entry: a concurrent session on another agent
+        # must not be able to invalidate the lookup between sidebar and render
+        registry.dispatch(entry, build_context(entry, agent_id, cookie_me))
         return True
     except Exception as error:  # noqa: BLE001 - a broken plugin must not crash the app
         failed.add(page_key)

@@ -268,6 +268,55 @@ def test_load_manifest_rejects_rita_with_permission(
         load_manifest(tmp_path / "cat_batch")
 
 
+def test_load_manifest_accepts_rita_capabilities(
+    tmp_path: Path, make_plugin, canonical_manifest: dict[str, Any]
+) -> None:
+    _component(canonical_manifest, "ingest-progress")["rita"] = {
+        "read": ["lti.context", "plugin.settings"],
+        "write": ["plugin.settings.update"],
+    }
+    make_plugin(tmp_path, manifest=canonical_manifest)
+
+    manifest = load_manifest(tmp_path / "cat_batch")
+
+    component = next(item for item in manifest.components if item.id == "ingest-progress")
+    assert component.rita is not None
+    assert component.rita.read == ["lti.context", "plugin.settings"]
+    assert component.rita.write == ["plugin.settings.update"]
+
+
+def test_load_manifest_rejects_rita_on_admin_component(
+    tmp_path: Path, make_plugin, canonical_manifest: dict[str, Any]
+) -> None:
+    _component(canonical_manifest, "batch-update")["rita"] = {"read": ["lti.context"]}
+    make_plugin(tmp_path, manifest=canonical_manifest)
+
+    with pytest.raises(PluginUiError, match="rita is forbidden"):
+        load_manifest(tmp_path / "cat_batch")
+
+
+def test_load_manifest_rejects_invalid_rita_capability_name(
+    tmp_path: Path, make_plugin, canonical_manifest: dict[str, Any]
+) -> None:
+    _component(canonical_manifest, "ingest-progress")["rita"] = {"read": ["Bad-Name"]}
+    make_plugin(tmp_path, manifest=canonical_manifest)
+
+    with pytest.raises(PluginUiError, match="should match pattern"):
+        load_manifest(tmp_path / "cat_batch")
+
+
+def test_load_manifest_rejects_too_many_rita_capabilities(
+    tmp_path: Path, make_plugin, canonical_manifest: dict[str, Any]
+) -> None:
+    _component(canonical_manifest, "ingest-progress")["rita"] = {
+        "read": [f"capability.{index}" for index in range(21)]
+    }
+    make_plugin(tmp_path, manifest=canonical_manifest)
+
+    with pytest.raises(PluginUiError, match="at most 20"):
+        load_manifest(tmp_path / "cat_batch")
+
+
 def test_load_manifest_rejects_slot_of_another_destination(
     tmp_path: Path, make_plugin, canonical_manifest: dict[str, Any]
 ) -> None:

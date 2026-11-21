@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -58,12 +58,14 @@ PermissionName = Literal["READ", "WRITE", "DELETE"]
 
 PLUGIN_ID_PATTERN = r"^[a-z0-9_]{1,64}$"
 COMPONENT_ID_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,63}$"
+RITA_CAPABILITY_PATTERN = r"^[a-z][a-z0-9_.]{1,63}$"
 MODULE_PATTERN = re.compile(r"^[A-Za-z0-9._/-]+$")
 
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_ADMIN_MODULE_BYTES = 512 * 1024
 MAX_COMPONENTS = 20
 MAX_CAT_ENDPOINTS = 50
+MAX_RITA_CAPABILITIES = 20
 MAX_ENDPOINT_LENGTH = 512
 
 ALLOWED_METHODS: frozenset[str] = frozenset({"GET", "POST"})
@@ -120,6 +122,23 @@ class Launch(BaseModel):
     mode: Literal["panel", "modal"]
 
 
+CapabilityName = Annotated[str, Field(pattern=RITA_CAPABILITY_PATTERN)]
+
+
+class RitaCapabilities(BaseModel):
+    """The host-defined capabilities a RITA component may call.
+
+    The names are opaque to the loader: the host publishes the set it
+    implements and enforces the declared allowlist at call time. ADMIN only
+    validates the shape and ignores the block at runtime.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    read: list[CapabilityName] = Field(default_factory=list, max_length=MAX_RITA_CAPABILITIES)
+    write: list[CapabilityName] = Field(default_factory=list, max_length=MAX_RITA_CAPABILITIES)
+
+
 class Component(BaseModel):
     """One UI component declared by a plugin."""
 
@@ -134,6 +153,7 @@ class Component(BaseModel):
     permission: Permission | None = None
     cat_endpoints: list[str] | None = Field(default=None, max_length=MAX_CAT_ENDPOINTS)
     launch: Launch | None = None
+    rita: RitaCapabilities | None = None
     order: int | None = Field(default=None, ge=0, le=100000)
 
     @field_validator("cat_endpoints")
@@ -164,6 +184,11 @@ class Component(BaseModel):
             if self.launch is not None:
                 raise ValueError(
                     f"component '{self.id}': launch is forbidden for "
+                    f"destination '{self.destination}'"
+                )
+            if self.rita is not None:
+                raise ValueError(
+                    f"component '{self.id}': rita is forbidden for "
                     f"destination '{self.destination}'"
                 )
             return self

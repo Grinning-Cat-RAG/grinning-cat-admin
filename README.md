@@ -140,6 +140,11 @@ ADMIN renders two of the four destinations:
 The `instructor` and `chatbot` destinations belong to RITA and are not rendered
 by ADMIN.
 
+The loader validates the `rita` capability block on those components but ignores
+it at runtime: ADMIN pages use `ctx.client` for data, not the RITA capability
+bridge. The block is accepted so a shared `ui.json` validates the same way in
+both hosts.
+
 ### Trust model
 
 Plugin code is trusted: an ADMIN page runs in the same trust domain as the
